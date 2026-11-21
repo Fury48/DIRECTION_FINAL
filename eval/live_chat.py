@@ -246,7 +246,8 @@ class Session:
     def __init__(self, args, relay):
         self.args, self.relay, self.history, self.n = args, relay, [], 0
         self.caller = {"name": None, "phone": args.caller, "email": None} if args.caller else None
-        self.expect = json.load(open(args.expect, encoding="utf-8-sig")) if args.expect else {}     # utf-8-sig: 메모장·파워셸이 붙이는 BOM 이 있어도 읽는다
+        self.call_id = f"CALL-{uuid.uuid4().hex[:8]}"                  # 이 통화 전체를 가리키는 번호: 서버가 같은 통화의 이전 말에서 잰 말 속도·쉼을 기억해 느린 사람에게 대기와 재생 속도를 맞춘다 (채점기는 보내지 않음)
+        self.expect =json.load(open(args.expect, encoding="utf-8-sig")) if args.expect else {}     # utf-8-sig: 메모장·파워셸이 붙이는 BOM 이 있어도 읽는다
         self.run_dir = ROOT / "runs" / "live" / datetime.now().strftime("%Y%m%d_%H%M%S")
         (self.run_dir / "agent_audio").mkdir(parents=True)
 
@@ -279,7 +280,7 @@ async def one_turn(sess, frames, player, barge=False):
     st = {"first_audio": None, "turn_end": None, "customer": "", "trace": [], "barge_pre": None, "played": None}
     baseline, history_before = player.played, list(sess.history)
     async with websockets.connect(args.server, max_size=None, open_timeout=10) as ws:
-        await ws.send(json.dumps({"type": "session.start", "session_id": sid, "case_id": f"LIVE{n}", "now": now, "history": history_before,
+        await ws.send(json.dumps({"type": "session.start", "session_id": sid, "call_id": sess.call_id, "case_id": f"LIVE{n}", "now": now, "history": history_before,
                                   "caller": sess.caller, "tools_url": f"http://localhost:{args.relay_port}",
                                   "audio": {"encoding": "pcm_s16le", "sample_rate": RATE, "channels": 1}, "debug": True}, ensure_ascii=False))
 

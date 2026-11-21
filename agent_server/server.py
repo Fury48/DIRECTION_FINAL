@@ -11,8 +11,10 @@
 준비:  pip install -r requirements.txt
        agent_server/.env 에 BAZE_API_KEY (대회 게이트웨이 키 하나로 셋 다) 또는 OPENAI_API_KEY, SONIOX_API_KEY, GEMINI_API_KEY 를 적는다 (.env.example 을 복사해서 사용)
 """
-import argparse, asyncio, hashlib, json, math, os, random, re, time
+import argparse, asyncio, contextvars, hashlib, json, math, os, random, re, time
+from collections import deque
 from contextlib import suppress
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx, numpy as np, websockets
@@ -70,7 +72,13 @@ PACE_ADAPT = os.getenv("PACE_ADAPT", "live")              # off 끔 / live 시�
 PACE_REF_CPS = float(os.getenv("PACE_REF_CPS", 5.3))      # 기준 발음 속도(글자/초). 이보다 느리면 대기를 늘린다. 합성 음성의 중앙값이라 사람 목소리로 다시 맞출 것 (pace.md 7절)
 PACE_MAX_FACTOR = float(os.getenv("PACE_MAX_FACTOR", 1.2))   # 기본 대기를 늘리는 최대 배율 (1.0 이면 늘리지 않음)
 PACE_PAUSE_MARGIN, PACE_MIN_PAUSE_MS = 1.25, 250          # 본인이 말 중간에 쉰 시간의 1.25배는 기다린다 / 250ms 미만의 끊김은 쉼으로 치지 않는다
-PACE_PROFILES = {}                                        # 발신자 → 통화 동안 쌓은 발음 속도. 우리 서버는 말 한 번마다 연결이 새로 열려서, 같은 통화를 알아볼 수 있는 값이 발신자 정보뿐이다 (서버를 다시 켜면 비워짐)
+PACE_EXTRA_LIVE_MS, PACE_EXTRA_MEASURE_MS = 600, 300      # 본인 쉼 때문에 기본 대기에서 늘어나는 최대 폭(시연 / 측정). 속도 배율 상한(1.2배)과 따로 둔다: 같이 묶으면 0.75초 쉬던 사람이 다음 턴에도 또 잘린다 (tts_speed_and_pace_handoff.md)
+PACE_LEARN_MAX_MS = int(os.getenv("PACE_LEARN_MAX_MS", 2000))   # 말 끝으로 확정한 뒤 고객이 이어 말하기까지 이 시간 안이면 '끼어들기에서 배운 쉼'으로 기억한다 (이보다 늦은 건 답하는 말을 끊은 것이라 배우지 않는다)
+PACE_PLAY = os.getenv("PACE_PLAY", "1") == "1"            # 느리게 말하는 사람에게는 상담원 음성도 음높이를 유지한 채 느리게 들려준다 (시험기·시연만, 0.85~1.0배)
+PACE_PLAY_MIN_SPEED = float(os.getenv("PACE_PLAY_MIN_SPEED", 0.85))   # 가장 느린 재생 속도. 이보다 낮으면 변환 울림이 들릴 수 있어 직접 들어 보고 낮출 것
+PACE_PLAY_GAP_MS = 150                                    # 느린 재생일 때 문장 사이에 넣는 쉼 (원래 쉼 ÷ 재생 속도)
+PACE_PROFILES = {}                                        # 통화 번호(call_id) → Profile. 우리 서버는 말 한 번마다 연결이 새로 열려서, 같은 통화를 알아보는 값(call_id)이 있을 때만 기록한다. 채점기는 call_id 를 안 보내므로 구조적으로 발동하지 않는다 (서버를 다시 켜면 비워짐)
+PLAY_SPEED = contextvars.ContextVar("play_speed", default=1.0)   # 이번 답의 재생 속도 (답을 시작할 때 정하고, 그 답을 말하는 작업들이 읽는다)
 LEAD_RMS, LEAD_KEEP_MS = 300, 40    # 말하기 음성 앞 무음을 자를 때: 이 볼륨부터 소리로 보고, 그 40ms 전부터 남긴다
 DEADLINE_S = float(os.getenv("DEADLINE_S", 18))           # 말 끝 이후 이 안에 마무리 (25초 안에 turn.end 필요)
 MAX_TOOL_ROUNDS = 3                 # LLM이 함수를 연달아 부를 수 있는 최대 횟수
@@ -264,11 +272,15 @@ def turn_rate(text, voiced_ms):
     return chars / (voiced_ms / 1000)
 
 
-def pace_wait(base_ms, rate, own_pause_ms=0):
-    """기본 대기(base_ms)를 말이 느린 사람에게만 1.0~PACE_MAX_FACTOR 배로 늘린다. 본인이 말 중간에 쉰 시간의 1.25배는 기다리되, 그래도 상한을 넘지 않는다."""
+def pace_wait(base_ms, rate, own_pause_ms=0, live=True):
+    """기본 대기(base_ms)를 말이 느린 사람에게만 늘린다. 줄이지는 않는다.
+    - 속도: 기준 속도 ÷ 이 사람 속도를 1.0~PACE_MAX_FACTOR 배로 곱한다.
+    - 본인 쉼: 이 사람이 말 중간에 쉰 시간의 1.25배는 기다리되, 늘어나는 폭은 모드별 상한(시연 +600ms, 측정 +300ms)까지."""
     factor = min(max(PACE_REF_CPS / rate, 1.0), PACE_MAX_FACTOR) if rate else 1.0
-    wait = max(base_ms * factor, own_pause_ms * PACE_PAUSE_MARGIN)
-    return min(max(wait, base_ms), base_ms * PACE_MAX_FACTOR)
+    wait = base_ms * factor
+    if own_pause_ms > 0:
+        wait = max(wait, min(own_pause_ms * PACE_PAUSE_MARGIN, base_ms + (PACE_EXTRA_LIVE_MS if live else PACE_EXTRA_MEASURE_MS)))
+    return max(wait, base_ms)
 
 
 def pace_enabled(start):
@@ -276,16 +288,52 @@ def pace_enabled(start):
     return PACE_ADAPT == "all" or (PACE_ADAPT == "live" and bool(start.get("debug")))
 
 
-def note_rate(caller, rate):
-    """이번 말의 발음 속도를 통화 누적값에 섞는다 (지수 평균 0.6/0.4). 1~12 글자/초 밖의 값은 잘못 잰 것이라 버린다."""
-    if caller and rate and 1 <= rate <= 12:
-        old = PACE_PROFILES.get(caller)
-        PACE_PROFILES[caller] = rate if old is None else 0.6 * old + 0.4 * rate
+@dataclass
+class Profile:
+    """통화 한 건 동안 쌓는 말하는 사람의 버릇 (말이 바뀌어도 유지)."""
+    rate: float | None = None                                        # 지난 말들의 발음 속도 (지수 평균)
+    pauses: deque = field(default_factory=lambda: deque(maxlen=5))   # 끝난 줄 알았는데 이어 말한 쉼 (ms), 최근 5개
+
+    def note_rate(self, rate):
+        """이번 말의 발음 속도를 섞는다 (지수 평균 0.6/0.4). 1~12 글자/초 밖의 값은 잘못 잰 것이라 버린다."""
+        if rate and 1 <= rate <= 12:
+            self.rate = rate if self.rate is None else 0.6 * self.rate + 0.4 * rate
+
+    def note_pause(self, ms):
+        if 200 <= ms <= 4000:
+            self.pauses.append(float(ms))
+
+    def pause_hint(self):
+        return max(self.pauses, default=0.0)
+
+    def ready(self):
+        """이전 말에서 잰 기록이 있는가. 첫 말은 기록만 하고 대기를 늘리지 않는다."""
+        return self.rate is not None or bool(self.pauses)
 
 
-async def listen(ws, stt, pace_on=False, caller="", judge=None, router=None):
+def profile_for(start):
+    """이 통화의 Profile. 통화를 알아보는 call_id 가 없으면 None (채점기는 안 보내므로 기록도 적용도 하지 않는다)."""
+    key = str(start.get("call_id") or "")
+    if not key:
+        return None
+    if key not in PACE_PROFILES and len(PACE_PROFILES) >= 200:       # 메모리가 무한히 늘지 않게 가장 오래된 것부터 지운다
+        PACE_PROFILES.pop(next(iter(PACE_PROFILES)))
+    return PACE_PROFILES.setdefault(key, Profile())
+
+
+def play_speed(profile, live=True):
+    """상담원 음성 재생 속도 (1.0 = 원래 속도). 느리게 말하는 사람에게만 느리게, 시험기·시연에서 이전 말의 속도 기록이 있을 때만.
+    0.05 단위로 맞춰 같은 문장의 변환 결과를 다시 쓴다."""
+    if not (live and PACE_PLAY and PACE_ADAPT != "off") or profile is None or not profile.rate:
+        return 1.0
+    sp = min(1.0, max(PACE_PLAY_MIN_SPEED, profile.rate / PACE_REF_CPS))
+    return round(round(sp / 0.05) * 0.05, 2)
+
+
+async def listen(ws, stt, pace_on=False, profile=None, judge=None, router=None, live=True):
     """말이 끝날 때까지 목소리를 받아 받아쓰기로 넘긴다. judge(Jev 말 끝 판정)·router(Jev 업무 분류)가 있으면 조용한 동안 그쪽에 묻는다.
-    돌려주는 값: 소리가 난 시간(voiced_ms), 말 속도로 대기를 조절했다면 그 내용(pace), Jev 판정 요약(eot)."""
+    pace_on 이고 profile(통화 기록)에 이전 말의 기록이 있으면(ready) 말이 느린 사람의 기본 대기를 늘린다. live: 시연(True)/측정(False)에 따라 본인 쉼 상한이 다르다.
+    돌려주는 값: 소리가 난 시간(voiced_ms), 말 끝으로 확정한 때의 무음(silent_ms), 말 속도 조절 내용(pace), Jev 판정 요약(eot)."""
     voiced_ms = silent_ms = total_ms = 0
     pauses, info = [], None                                  # pauses: 말 중간에 쉰 시간들 (250ms 이상)
     try:
@@ -316,11 +364,13 @@ async def listen(ws, stt, pace_on=False, caller="", judge=None, router=None):
                 if wait_ms == END_SILENCE_MS:                # 이어질 말투·번호·말 고치기 같은 규칙이 없는 보통 말
                     if verdict == "end":
                         wait_ms = jev.EOT_END_MS             # Jev 가 끝났다고 보면 650ms 만에 끊는다 (규칙이 '더 기다려라' 하면 규칙을 따른다: 끊는 쪽 실수는 속도 0점이라)
-                    elif pace_on:                            # 빨리 확정하는 기본 규칙에만 말 속도 조절을 적용한다
-                        rate = turn_rate(text, voiced_ms) or PACE_PROFILES.get(caller)   # 이번 말로 못 재면 통화 누적값. (받아쓰기 글은 소리보다 늦게 와서 말하는 도중엔 속도가 실제보다 느리게 나오지만, 상한 배율이 막아 준다)
-                        own = max(pauses, default=0)
-                        wait_ms = pace_wait(wait_ms, rate, own)
-                        info = {"cps": round(rate, 1) if rate else None, "own_pause_ms": own, "base_ms": END_SILENCE_MS, "thr_ms": round(wait_ms)}
+                    elif pace_on and profile is not None:    # 빨리 확정하는 기본 규칙에만 말 속도 조절을 적용한다
+                        rate = turn_rate(text, voiced_ms) or profile.rate   # 이번 말로 못 재면 통화 누적값. (받아쓰기 글은 소리보다 늦게 와서 말하는 도중엔 속도가 실제보다 느리게 나오지만, 상한 배율이 막아 준다)
+                        own = max(max(pauses, default=0), profile.pause_hint())    # 이번 말 중간의 쉼, 지난번에 끼어들며 배운 쉼 중 큰 쪽
+                        ready = profile.ready()
+                        if ready:                            # 첫 말은 기록만 한다 (채점은 질문 하나뿐이라 이전 기록이 없어 구조적으로 발동하지 않는다)
+                            wait_ms = pace_wait(wait_ms, rate, own, live)
+                        info = {"cps": round(rate, 1) if rate else None, "own_pause_ms": round(own), "base_ms": END_SILENCE_MS, "thr_ms": round(wait_ms), "ready": ready}
             if verdict == "hold":
                 wait_ms = max(wait_ms, jev.EOT_HOLD_MS)      # Jev 가 더 이어질 말이라고 보면 2.5초까지 기다린다
             if silent_ms >= wait_ms or total_ms >= MAX_LISTEN_MS:
@@ -328,14 +378,29 @@ async def listen(ws, stt, pace_on=False, caller="", judge=None, router=None):
     finally:
         if judge:
             judge.close()
-    return {"voiced_ms": voiced_ms, "pace": info, "eot": judge.summary() if judge else None}
+    return {"voiced_ms": voiced_ms, "silent_ms": silent_ms, "pace": info, "eot": judge.summary() if judge else None}
 
 
-async def drain(ws):
-    """말이 끝난 뒤에도 측정기는 무음을 계속 보낸다. 읽어서 버린다."""
+async def drain(ws, profile=None, silent_ms=0):
+    """말이 끝난 뒤에도 측정기는 무음을 계속 보낸다. 읽어서 버린다.
+    profile 이 있으면(시험기·시연) 그 사이에 고객이 이어 말하는지도 본다: 말 끝으로 확정한 뒤 PACE_LEARN_MAX_MS 안에 다시 말하기 시작하면
+    '서버가 너무 일찍 끊었다'는 뜻이라, 쉬었던 시간(silent_ms + 그 뒤 흐른 시간)을 이 사람의 쉼으로 기억해 다음 말의 대기에 반영한다."""
+    elapsed = run = 0
+    learned = profile is None
     with suppress(websockets.ConnectionClosed):
-        async for _ in ws:
-            pass
+        async for m in ws:
+            if learned or not isinstance(m, bytes):
+                continue
+            ms = len(m) * 1000 // (RATE * 2)
+            elapsed += ms
+            run = run + 1 if rms(m) >= SPEECH_RMS else 0
+            if run >= 5:                                     # 소리가 100ms 이상 이어져야 말이 다시 시작된 것 (잡음 한 조각은 거른다)
+                learned = True
+                gap = silent_ms + elapsed - run * ms
+                if gap <= PACE_LEARN_MAX_MS:
+                    profile.note_pause(gap)
+            elif elapsed + silent_ms > PACE_LEARN_MAX_MS:
+                learned = True                               # 이 시간이 지난 뒤의 말은 답하는 말을 끊은 것이라 배우지 않는다
 
 
 # ── 3. 생각: LLM + 모의 함수 서버 ───────────────────────────────────
@@ -616,6 +681,73 @@ def trim_lead(pcm):
     return pcm if start is None else pcm[start:]
 
 
+def time_stretch(pcm, speed, rate=RATE):
+    """음높이는 그대로 두고 말 속도만 바꾼다 (WSOLA). speed 0.9 → 길이 1/0.9.
+    30ms 창을 15ms 간격으로 이어 붙이되, 앞 조각과 파형이 가장 잘 이어지는 자리를 ±10ms 안에서 찾는다. 10초 문장에 약 20ms 라 첫 소리 시간에 영향이 없다."""
+    if not pcm or abs(speed - 1.0) < 1e-3:
+        return pcm
+    pcm = pcm[: len(pcm) // 2 * 2]                           # 홀수 바이트는 마지막 1바이트를 버린다 (int16 단위)
+    n_in = len(pcm) // 2
+    frame = int(rate * 0.03)
+    hop_out = frame // 2
+    hop_in = hop_out * speed
+    tol = int(rate * 0.01)
+    if n_in < frame * 3 + tol * 2:                           # 약 0.1초 미만은 그대로
+        return pcm
+    # 끝에 0을 덧대 마지막 조각까지 다 쓰고, 결과를 목표 길이(입력 ÷ 속도)로 자른다 (덧대지 않으면 끝 어미 약 40ms 가 잘린다)
+    x = np.concatenate([np.frombuffer(pcm, dtype=np.int16).astype(np.float32), np.zeros(frame + tol + hop_out, dtype=np.float32)])
+    target_len = int(round(n_in / speed))
+    n = int((len(x) - frame - tol - hop_out) / hop_in)
+    if n < 2:
+        return pcm
+    win = np.hanning(frame).astype(np.float32)
+    y = np.zeros(n * hop_out + frame, dtype=np.float32)
+    w = np.zeros_like(y)
+    prev = 0
+    for k in range(n):
+        if k == 0:
+            pos = 0
+        else:
+            nat = prev + hop_out                             # 앞 조각이 자연스럽게 이어지는 자리
+            ref = x[nat:nat + frame]
+            target = int(round(k * hop_in))
+            lo, hi = max(0, target - tol), min(len(x) - frame, target + tol)
+            if hi <= lo or len(ref) < frame:
+                pos = min(max(0, target), len(x) - frame)
+            else:
+                pos = lo + int(np.argmax(np.correlate(x[lo:hi + frame], ref, mode="valid")))
+        o = k * hop_out
+        y[o:o + frame] += x[pos:pos + frame] * win
+        w[o:o + frame] += win
+        prev = pos
+    y = (y / np.where(w > 0.1, w, 1.0))[:target_len]
+    return np.clip(y, -32768, 32767).astype(np.int16).tobytes()
+
+
+PACED = {}                                                   # (음성 해시, 길이, 속도) → 느리게 만든 음성. 같은 고정 문구를 다시 변환하지 않는다 (최대 200개)
+
+
+def paced(pcm, speed):
+    """보내기 직전에 재생 속도를 적용한다. 음성은 늘 1.0배로 만들어 캐시하고, 여기서 한 번만 바꾼다 (캐시에 속도를 넣으면 다시 바꿀 때 두 번 변환돼 음질이 떨어진다). 실패하면 원래 음성."""
+    if speed >= 1.0 or not pcm:
+        return pcm
+    key = (hash(pcm), len(pcm), speed)
+    if key not in PACED:
+        try:
+            out = time_stretch(pcm, speed)
+        except Exception as e:
+            print(f"재생 속도 변환 실패, 원래 음성으로: {e!r}"[:200], flush=True)
+            return pcm
+        if len(PACED) >= 200:
+            PACED.pop(next(iter(PACED)))
+        PACED[key] = out
+    return PACED[key]
+
+
+def silence_pcm(ms):
+    return bytes(int(RATE * ms / 1000) * 2)
+
+
 def phrase_key(text):
     """고정 문구를 찾을 때 띄어쓰기와 문장부호 차이는 무시한다."""
     return re.sub(r"[\s.,!?~…]", "", text)
@@ -715,8 +847,28 @@ async def audio_pieces(units):
             task.cancel()
 
 
+async def sentence_audio(units):
+    """문장 하나의 음성을 통째로 모아 문장 순서대로 내보낸다 (재생 속도를 바꿀 때 쓴다: 문장을 다 받은 뒤에야 변환할 수 있다).
+    스트리밍이 꺼져 있으면(게이트웨이) 모든 문장을 동시에 만들기 시작하고, 켜져 있으면(직접 호출) 한도를 아끼려고 차례로 만든다."""
+    async def whole(unit):
+        return b"".join([piece async for piece in speak_chunks(unit)])
+
+    if TTS_STREAM:
+        for unit in units:
+            yield await whole(unit)
+        return
+    tasks = [asyncio.create_task(whole(unit)) for unit in units]
+    try:
+        for task in tasks:
+            yield await task
+    finally:
+        for task in tasks:
+            task.cancel()
+
+
 async def say(ws, text, lap=None, label="첫 소리 전송"):
-    """답을 읽혀서, 음성이 만들어지는 대로 20ms 조각으로 바로 내보낸다."""
+    """답을 읽혀서, 음성이 만들어지는 대로 20ms 조각으로 바로 내보낸다. 이번 답의 재생 속도(PLAY_SPEED)가 1.0 미만이면
+    문장 단위로 음성을 모아 음높이를 유지한 채 느리게 바꾸고, 문장 사이 쉼도 같은 비율로 늘려서 내보낸다."""
     announced = False                                         # 글(agent.transcript)은 첫 음성이 만들어진 뒤에 보낸다: 음성 만들기가 실패하면 말하지도 않은 글이 대화 기록에 남지 않게
 
     async def announce():
@@ -726,7 +878,9 @@ async def say(ws, text, lap=None, label="첫 소리 전송"):
             await ws.send(json.dumps({"type": "agent.transcript", "text": text}, ensure_ascii=False))
 
     pending, first = b"", True
-    async for piece in audio_pieces(sentences(for_tts(text))):
+
+    async def feed(piece):
+        nonlocal pending, first
         pending += piece
         while len(pending) >= FRAME:
             await announce()
@@ -735,6 +889,18 @@ async def say(ws, text, lap=None, label="첫 소리 전송"):
             if first and lap:
                 lap(label)
                 first = False
+
+    units, speed = sentences(for_tts(text)), PLAY_SPEED.get()
+    if speed < 1.0:
+        count = 0
+        async for pcm in sentence_audio(units):
+            if count:
+                await feed(silence_pcm(PACE_PLAY_GAP_MS / speed))
+            await feed(paced(pcm, speed))
+            count += 1
+    else:
+        async for piece in audio_pieces(units):
+            await feed(piece)
     if pending:
         await announce()
         await ws.send(pending.ljust(FRAME, b"\0"))
@@ -775,12 +941,17 @@ def with_closing(reply, closing):
     return f"{reply.rstrip()}{'' if reply.rstrip()[-1] in '.!' else '.'} {random.choice(ready)}" if ready else reply
 
 
-async def respond(ws, start, stt, tools, lap, heard=None, router=None):
+async def respond(ws, start, stt, tools, lap, heard=None, router=None, profile=None):
     cid = start.get("case_id")
     text = await stt.finish()
     lap("받아쓰기 확정")
-    if heard and PACE_ADAPT != "off":                         # 확정된 글로 이 사람의 발음 속도를 통화 누적값에 섞는다 (다음 말에서 이번 말로 못 잴 때 쓴다)
-        note_rate(str(start.get("caller") or ""), turn_rate(text, heard["voiced_ms"]))
+    if profile is not None:                                   # 말 속도에 맞춘 처리 (시험기·시연): 이전 말들의 기록으로 이번 답의 재생 속도를 정하고, 그다음 이번 말의 속도를 기록에 섞는다
+        speed = play_speed(profile, live=bool(start.get("debug")))
+        PLAY_SPEED.set(speed)                                 # 이 답을 말하는 작업들(먼저 하는 말·채움말·본 답)이 읽어 간다
+        if speed < 1.0:
+            print(f"[{cid}] 느린 말투 → 상담원 재생 {speed}배, 문장 사이 쉼 {round(PACE_PLAY_GAP_MS / speed)}ms", flush=True)
+        if heard:
+            profile.note_rate(turn_rate(text, heard["voiced_ms"]))
     decision = await router.resolve(text) if router and text else None   # Jev 업무 분류: 말하는 동안 미리 물어 둔 결과를 쓰고, 없으면 최대 CASE_WAIT_S 만 기다린다
     if decision:
         lap("업무 분류")
@@ -821,8 +992,10 @@ async def talk(ws, start, stt):
     tools = asyncio.create_task(load_tools(start))            # 고객이 말하는 동안 미리 받아 둔다
     judge = jev.TurnJudge(http, start.get("history")) if jev.active(jev.EOT_MODE, start) else None      # Jev 말 끝 판정 (키가 없거나 꺼져 있으면 None → 예전 규칙)
     router = jev.CaseRouter(http, start.get("history")) if jev.active(jev.CASE_ROUTER, start) else None    # Jev 업무 분류
+    pace_on = pace_enabled(start)
+    profile = profile_for(start) if pace_on else None         # 통화 기록 (call_id 를 보내는 시험기·시연만. 채점기는 안 보내서 None → 말 속도 기능이 구조적으로 꺼짐)
     try:
-        heard = await listen(ws, stt, pace_enabled(start), str(start.get("caller") or ""), judge, router)
+        heard = await listen(ws, stt, pace_on, profile, judge, router, live=bool(start.get("debug")))
     except BaseException:
         if router:
             router.close()
@@ -832,9 +1005,9 @@ async def talk(ws, start, stt):
         print(f"[{cid}] Jev 말 끝: 요청 {e['calls']}회 (end {e['end']}·hold {e['hold']}·오류 {e['errors']}·글 모양으로 거름 {e['vetoed']}), 평균 {e['avg_ms']}ms", flush=True)
     if p := heard["pace"]:                                    # 받아쓴 글은 남기지 않는다. cps 를 보고 PACE_REF_CPS 를 맞춘다 (pace.md 7절)
         cps = str(p["cps"]) + "자/초" if p["cps"] else "(못 잼)"
-        print(f"[{cid}] 말 속도 {cps}, 말 중간 최대 쉼 {p['own_pause_ms']}ms → 말 끝 대기 {p['base_ms']}→{p['thr_ms']}ms", flush=True)
-    lap, sink = Lap(cid), asyncio.create_task(drain(ws))
-    work = asyncio.create_task(asyncio.wait_for(respond(ws, start, stt, tools, lap, heard, router), DEADLINE_S))
+        print(f"[{cid}] 말 속도 {cps}, 말 중간 최대 쉼 {p['own_pause_ms']}ms → 말 끝 대기 {p['base_ms']}→{p['thr_ms']}ms" + ("" if p["ready"] else " (이 통화의 첫 말: 기록만)"), flush=True)
+    lap, sink = Lap(cid), asyncio.create_task(drain(ws, profile, heard["silent_ms"]))      # 답하는 동안 고객이 이어 말하면 그 쉼을 배운다
+    work = asyncio.create_task(asyncio.wait_for(respond(ws, start, stt, tools, lap, heard, router, profile), DEADLINE_S))
     closed, gone = asyncio.create_task(ws.wait_closed()), False
     try:
         await asyncio.wait({work, closed}, return_when=asyncio.FIRST_COMPLETED)
