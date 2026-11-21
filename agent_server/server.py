@@ -63,6 +63,13 @@ CORRECT_SILENCE_MS = int(os.getenv("CORRECT_SILENCE_MS", 2500))   # '잘못 얘�
 CORRECTING = re.compile(r"^(?:[아어음저네그][,.\s]*)?(?:잘못|아니(?=[\s,])|아냐|잠깐|잠시|다시|그게\s*아니)")   # 말을 고치는 시작 말 (대답인 "아니요"는 제외. 받아쓰기가 한 박자 늦어 "아니"만 보일 수 있어, 뒤에 띄어쓰기가 올 때만 센다)
 DIGITS_TAIL = re.compile(r"([0-9][0-9\s\-.]*)$")          # 받아쓴 글이 숫자로 끝나는 부분 (번호를 말하다 쉬는 중인지 볼 때 쓴다)
 MAX_LISTEN_MS = 30_000              # 아무리 길어도 여기서 듣기를 멈춘다
+# ── 말하는 속도에 맞춘 말 끝 대기 (pace.md): 느리게 말하는 사람은 문장 사이 쉼도 길어서 기본 대기(END_SILENCE_MS)만으로는 말 도중에 끼어든다.
+# 그래서 말이 느리거나 쉼이 긴 사람에게만 기본 대기를 조금 늘린다. 줄이지는 않는다(줄이면 끼어들어 속도 0점). 이미 1.8~2.5초 기다리는 규칙에는 적용하지 않는다.
+PACE_ADAPT = os.getenv("PACE_ADAPT", "live")              # off 끔 / live 시험기·시연(session.start 에 debug 가 있을 때)만 / all 측정 포함 (측정 음성은 합성이라 속도와 쉼이 무관하니 all 은 pace.md 9절을 확인한 뒤에)
+PACE_REF_CPS = float(os.getenv("PACE_REF_CPS", 5.3))      # 기준 발음 속도(글자/초). 이보다 느리면 대기를 늘린다. 합성 음성의 중앙값이라 사람 목소리로 다시 맞출 것 (pace.md 7절)
+PACE_MAX_FACTOR = float(os.getenv("PACE_MAX_FACTOR", 1.2))   # 기본 대기를 늘리는 최대 배율 (1.0 이면 늘리지 않음)
+PACE_PAUSE_MARGIN, PACE_MIN_PAUSE_MS = 1.25, 250          # 본인이 말 중간에 쉰 시간의 1.25배는 기다린다 / 250ms 미만의 끊김은 쉼으로 치지 않는다
+PACE_PROFILES = {}                                        # 발신자 → 통화 동안 쌓은 발음 속도. 우리 서버는 말 한 번마다 연결이 새로 열려서, 같은 통화를 알아볼 수 있는 값이 발신자 정보뿐이다 (서버를 다시 켜면 비워짐)
 LEAD_RMS, LEAD_KEEP_MS = 300, 40    # 말하기 음성 앞 무음을 자를 때: 이 볼륨부터 소리로 보고, 그 40ms 전부터 남긴다
 DEADLINE_S = float(os.getenv("DEADLINE_S", 18))           # 말 끝 이후 이 안에 마무리 (25초 안에 turn.end 필요)
 MAX_TOOL_ROUNDS = 3                 # LLM이 함수를 연달아 부를 수 있는 최대 횟수
@@ -246,8 +253,39 @@ def rms(pcm):
     return float(np.sqrt(np.mean(a * a))) if len(a) else 0.0
 
 
-async def listen(ws, stt):
+def turn_rate(text, voiced_ms):
+    """발음 속도(글자/초) = 받아쓴 한글·영문 글자 수 ÷ 소리가 난 시간(쉬는 시간 제외). 숫자는 읽는 길이가 사람마다 달라 뺀다.
+    근거가 부족하면(8자 미만, 소리 1.5초 미만, 번호 위주의 말) None."""
+    chars = len(re.findall(r"[가-힣A-Za-z]", text))
+    digits = sum(c.isdigit() for c in text)
+    if chars < 8 or voiced_ms < 1500 or digits * 2 > chars:
+        return None
+    return chars / (voiced_ms / 1000)
+
+
+def pace_wait(base_ms, rate, own_pause_ms=0):
+    """기본 대기(base_ms)를 말이 느린 사람에게만 1.0~PACE_MAX_FACTOR 배로 늘린다. 본인이 말 중간에 쉰 시간의 1.25배는 기다리되, 그래도 상한을 넘지 않는다."""
+    factor = min(max(PACE_REF_CPS / rate, 1.0), PACE_MAX_FACTOR) if rate else 1.0
+    wait = max(base_ms * factor, own_pause_ms * PACE_PAUSE_MARGIN)
+    return min(max(wait, base_ms), base_ms * PACE_MAX_FACTOR)
+
+
+def pace_enabled(start):
+    """이 통화에서 말 속도 대기를 쓰는가. 기본(live)은 시험기·시연(debug)만이라, debug 를 켜지 않는 측정기에는 영향이 없다."""
+    return PACE_ADAPT == "all" or (PACE_ADAPT == "live" and bool(start.get("debug")))
+
+
+def note_rate(caller, rate):
+    """이번 말의 발음 속도를 통화 누적값에 섞는다 (지수 평균 0.6/0.4). 1~12 글자/초 밖의 값은 잘못 잰 것이라 버린다."""
+    if caller and rate and 1 <= rate <= 12:
+        old = PACE_PROFILES.get(caller)
+        PACE_PROFILES[caller] = rate if old is None else 0.6 * old + 0.4 * rate
+
+
+async def listen(ws, stt, pace_on=False, caller=""):
+    """말이 끝날 때까지 목소리를 받아 받아쓰기로 넘긴다. 돌려주는 값: 소리가 난 시간(voiced_ms)과, 말 속도로 대기를 조절했다면 그 내용(pace)."""
     voiced_ms = silent_ms = total_ms = 0
+    pauses, info = [], None                                  # pauses: 말 중간에 쉰 시간들 (250ms 이상)
     async for m in ws:
         if not isinstance(m, bytes):
             continue
@@ -255,12 +293,22 @@ async def listen(ws, stt):
         ms = len(m) * 1000 // (RATE * 2)
         total_ms += ms
         if rms(m) >= SPEECH_RMS:
+            if silent_ms >= PACE_MIN_PAUSE_MS and voiced_ms >= MIN_SPEECH_MS:   # 쉬었다가 다시 말하기 시작함
+                pauses.append(silent_ms)
             voiced_ms, silent_ms = voiced_ms + ms, 0
         elif voiced_ms >= MIN_SPEECH_MS:                     # 말이 시작된 뒤의 조용한 시간만 센다
             silent_ms += ms
-        wait_ms = stt.wait_ms() if silent_ms >= END_SILENCE_MS else END_SILENCE_MS
+        wait_ms, info = END_SILENCE_MS, None
+        if silent_ms >= END_SILENCE_MS:
+            wait_ms = stt.wait_ms()
+            if pace_on and wait_ms == END_SILENCE_MS:        # 빨리 확정하는 기본 규칙에만 적용한다
+                rate = turn_rate(stt.text + stt.partial, voiced_ms) or PACE_PROFILES.get(caller)   # 이번 말로 못 재면 통화 누적값. (받아쓰기 글은 소리보다 늦게 와서 말하는 도중엔 속도가 실제보다 느리게 나오지만, 상한 배율이 막아 준다)
+                own = max(pauses, default=0)
+                wait_ms = pace_wait(wait_ms, rate, own)
+                info = {"cps": round(rate, 1) if rate else None, "own_pause_ms": own, "base_ms": END_SILENCE_MS, "thr_ms": round(wait_ms)}
         if silent_ms >= wait_ms or total_ms >= MAX_LISTEN_MS:
             break
+    return {"voiced_ms": voiced_ms, "pace": info}
 
 
 async def drain(ws):
@@ -702,10 +750,12 @@ def with_closing(reply, closing):
     return f"{reply.rstrip()}{'' if reply.rstrip()[-1] in '.!' else '.'} {random.choice(ready)}" if ready else reply
 
 
-async def respond(ws, start, stt, tools, lap):
+async def respond(ws, start, stt, tools, lap, heard=None):
     cid = start.get("case_id")
     text = await stt.finish()
     lap("받아쓰기 확정")
+    if heard and PACE_ADAPT != "off":                         # 확정된 글로 이 사람의 발음 속도를 통화 누적값에 섞는다 (다음 말에서 이번 말로 못 잴 때 쓴다)
+        note_rate(str(start.get("caller") or ""), turn_rate(text, heard["voiced_ms"]))
     if start.get("debug"):                                    # 시험기에게 받아쓴 글을 바로 알려 준다 (손님이 말을 끊어도 어떤 말이었는지 기록할 수 있게)
         await ws.send(json.dumps({"type": "debug.heard", "customer": text}, ensure_ascii=False))
     macro = pick_case(text, start)                            # (먼저 하는 말, 끝맺음 여부) 또는 None
@@ -740,10 +790,13 @@ async def respond(ws, start, stt, tools, lap):
 
 async def talk(ws, start, stt):
     tools = asyncio.create_task(load_tools(start))            # 고객이 말하는 동안 미리 받아 둔다
-    await listen(ws, stt)
+    heard = await listen(ws, stt, pace_enabled(start), str(start.get("caller") or ""))
     cid = start.get("case_id")
+    if p := heard["pace"]:                                    # 받아쓴 글은 남기지 않는다. cps 를 보고 PACE_REF_CPS 를 맞춘다 (pace.md 7절)
+        cps = str(p["cps"]) + "자/초" if p["cps"] else "(못 잼)"
+        print(f"[{cid}] 말 속도 {cps}, 말 중간 최대 쉼 {p['own_pause_ms']}ms → 말 끝 대기 {p['base_ms']}→{p['thr_ms']}ms", flush=True)
     lap, sink = Lap(cid), asyncio.create_task(drain(ws))
-    work = asyncio.create_task(asyncio.wait_for(respond(ws, start, stt, tools, lap), DEADLINE_S))
+    work = asyncio.create_task(asyncio.wait_for(respond(ws, start, stt, tools, lap, heard), DEADLINE_S))
     closed, gone = asyncio.create_task(ws.wait_closed()), False
     try:
         await asyncio.wait({work, closed}, return_when=asyncio.FIRST_COMPLETED)
