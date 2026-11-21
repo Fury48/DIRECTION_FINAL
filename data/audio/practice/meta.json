@@ -1,0 +1,322 @@
+{
+ "P0010-11": {
+  "speech_end": 18.3,
+  "voice": "shimmer"
+ },
+ "P0017-02": {
+  "speech_end": 4.88,
+  "voice": "coral"
+ },
+ "P0019-02": {
+  "speech_end": 5.36,
+  "voice": "echo"
+ },
+ "P0018-05": {
+  "speech_end": 3.84,
+  "voice": "verse"
+ },
+ "P0021-10": {
+  "speech_end": 4.0,
+  "voice": "shimmer"
+ },
+ "P0023-01": {
+  "speech_end": 5.94,
+  "voice": "verse"
+ },
+ "P0026-01": {
+  "speech_end": 2.58,
+  "voice": "ballad"
+ },
+ "P0027-01": {
+  "speech_end": 6.16,
+  "voice": "ballad"
+ },
+ "P0029-01": {
+  "speech_end": 1.26,
+  "voice": "echo"
+ },
+ "P0025-01": {
+  "speech_end": 6.46,
+  "voice": "ash"
+ },
+ "P0031-02": {
+  "speech_end": 2.56,
+  "voice": "ash"
+ },
+ "P0032-09": {
+  "speech_end": 4.54,
+  "voice": "alloy"
+ },
+ "P0034-03": {
+  "speech_end": 4.6,
+  "voice": "echo"
+ },
+ "P0038-02": {
+  "speech_end": 1.66,
+  "voice": "ash"
+ },
+ "P0042-01": {
+  "speech_end": 1.62,
+  "voice": "coral"
+ },
+ "P0043-01": {
+  "speech_end": 4.4,
+  "voice": "alloy"
+ },
+ "P0044-02": {
+  "speech_end": 4.86,
+  "voice": "coral"
+ },
+ "P0047-03": {
+  "speech_end": 5.32,
+  "voice": "shimmer"
+ },
+ "P0049-01": {
+  "speech_end": 4.52,
+  "voice": "ballad"
+ },
+ "P0052-02": {
+  "speech_end": 5.42,
+  "voice": "alloy"
+ },
+ "P0054-02": {
+  "speech_end": 7.38,
+  "voice": "echo"
+ },
+ "P0058-02": {
+  "speech_end": 3.04,
+  "voice": "echo"
+ },
+ "P0060-02": {
+  "speech_end": 2.52,
+  "voice": "echo"
+ },
+ "P0061-06": {
+  "speech_end": 1.62,
+  "voice": "sage"
+ },
+ "P0072-01": {
+  "speech_end": 5.34,
+  "voice": "ballad"
+ },
+ "P0071-05": {
+  "speech_end": 5.72,
+  "voice": "coral"
+ },
+ "P0077-01": {
+  "speech_end": 4.78,
+  "voice": "sage"
+ },
+ "P0084-01": {
+  "speech_end": 1.74,
+  "voice": "alloy"
+ },
+ "P0086-02": {
+  "speech_end": 11.54,
+  "voice": "coral"
+ },
+ "P0095-06": {
+  "speech_end": 3.32,
+  "voice": "verse"
+ },
+ "P0099-03": {
+  "speech_end": 7.16,
+  "voice": "ash"
+ },
+ "P0104-01": {
+  "speech_end": 2.5,
+  "voice": "echo"
+ },
+ "P0106-02": {
+  "speech_end": 5.8,
+  "voice": "ash"
+ },
+ "P0107-01": {
+  "speech_end": 2.78,
+  "voice": "verse"
+ },
+ "P0110-02": {
+  "speech_end": 22.82,
+  "voice": "coral"
+ },
+ "P0114-02": {
+  "speech_end": 2.02,
+  "voice": "coral"
+ },
+ "P0113-03": {
+  "speech_end": 5.78,
+  "voice": "shimmer"
+ },
+ "P0117-01": {
+  "speech_end": 3.52,
+  "voice": "sage"
+ },
+ "P0119-04": {
+  "speech_end": 6.84,
+  "voice": "ballad"
+ },
+ "P0120-01": {
+  "speech_end": 4.24,
+  "voice": "echo"
+ },
+ "P0121-01": {
+  "speech_end": 5.64,
+  "voice": "coral"
+ },
+ "P0124-01": {
+  "speech_end": 3.44,
+  "voice": "shimmer"
+ },
+ "P0125-01": {
+  "speech_end": 3.16,
+  "voice": "shimmer"
+ },
+ "P0131-01": {
+  "speech_end": 1.92,
+  "voice": "alloy"
+ },
+ "P0130-01": {
+  "speech_end": 8.28,
+  "voice": "verse"
+ },
+ "P0134-01": {
+  "speech_end": 5.84,
+  "voice": "sage"
+ },
+ "P0133-03": {
+  "speech_end": 6.7,
+  "voice": "coral"
+ },
+ "P0135-01": {
+  "speech_end": 5.7,
+  "voice": "ash"
+ },
+ "P0137-01": {
+  "speech_end": 7.66,
+  "voice": "shimmer"
+ },
+ "P0139-03": {
+  "speech_end": 10.96,
+  "voice": "ash"
+ },
+ "P0144-01": {
+  "speech_end": 1.84,
+  "voice": "verse"
+ },
+ "P0147-07": {
+  "speech_end": 3.68,
+  "voice": "alloy"
+ },
+ "P0148-02": {
+  "speech_end": 5.18,
+  "voice": "ballad"
+ },
+ "P0148-08": {
+  "speech_end": 1.76,
+  "voice": "ash"
+ },
+ "P0149-01": {
+  "speech_end": 3.26,
+  "voice": "coral"
+ },
+ "P0152-01": {
+  "speech_end": 7.18,
+  "voice": "coral"
+ },
+ "P0154-02": {
+  "speech_end": 4.06,
+  "voice": "ballad"
+ },
+ "P0155-01": {
+  "speech_end": 3.74,
+  "voice": "shimmer"
+ },
+ "P0158-01": {
+  "speech_end": 4.1,
+  "voice": "ballad"
+ },
+ "P0164-05": {
+  "speech_end": 2.72,
+  "voice": "verse"
+ },
+ "P0165-01": {
+  "speech_end": 4.04,
+  "voice": "ballad"
+ },
+ "P0166-01": {
+  "speech_end": 5.92,
+  "voice": "ash"
+ },
+ "P0167-03": {
+  "speech_end": 16.62,
+  "voice": "sage"
+ },
+ "P0173-02": {
+  "speech_end": 5.28,
+  "voice": "shimmer"
+ },
+ "P0177-09": {
+  "speech_end": 2.5,
+  "voice": "shimmer"
+ },
+ "P0180-01": {
+  "speech_end": 1.54,
+  "voice": "sage"
+ },
+ "P0185-02": {
+  "speech_end": 2.9,
+  "voice": "sage"
+ },
+ "P0188-01": {
+  "speech_end": 2.9,
+  "voice": "verse"
+ },
+ "P0189-01": {
+  "speech_end": 11.6,
+  "voice": "alloy"
+ },
+ "P0192-02": {
+  "speech_end": 2.66,
+  "voice": "verse"
+ },
+ "P0193-02": {
+  "speech_end": 4.54,
+  "voice": "ballad"
+ },
+ "P0194-03": {
+  "speech_end": 4.22,
+  "voice": "verse"
+ },
+ "P0196-02": {
+  "speech_end": 5.28,
+  "voice": "verse"
+ },
+ "P0200-02": {
+  "speech_end": 6.66,
+  "voice": "shimmer"
+ },
+ "P0197-03": {
+  "speech_end": 9.84,
+  "voice": "sage"
+ },
+ "P0001-02": {
+  "speech_end": 2.58,
+  "voice": "echo"
+ },
+ "P0066-01": {
+  "speech_end": 3.52,
+  "voice": "echo"
+ },
+ "P0074-01": {
+  "speech_end": 6.64,
+  "voice": "sage"
+ },
+ "P0067-01": {
+  "speech_end": 14.34,
+  "voice": "coral"
+ },
+ "P0175-02": {
+  "speech_end": 18.92,
+  "voice": "shimmer"
+ }
+}

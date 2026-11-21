@@ -1,0 +1,6 @@
+# 윈도우에서 올려도 리눅스 컨테이너에서 실행되는 파일은 줄바꿈이 LF 여야 합니다 (CRLF 면 bash start_server.sh 가 오류)
+* text=auto
+*.sh text eol=lf
+requirements.txt text eol=lf
+*.pcm binary
+*.wav binary
