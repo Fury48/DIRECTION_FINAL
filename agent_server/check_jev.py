@@ -234,7 +234,9 @@ def waited(text, reply, **kw):
 end = lambda b: choice("turn", "end", 0.95, ("hold",))
 hold = lambda b: choice("turn", "hold", 0.95, ("end",))
 ms, heard, h = waited(T, end);                       assert ms == jev.EOT_END_MS + 10 and heard["eot"]["end"] > 0, ms     # Jev end → 650ms (20ms 단위로 660)
-ms, heard, h = waited(T, hold);                      assert ms == jev.EOT_HOLD_MS, ms                                      # Jev hold → 2.5초
+ms, heard, h = waited("주문번호는 이십 이십 영", hold);   assert ms == jev.EOT_HOLD_MS, ms                                      # Jev hold → 2.5초 (덜 끝난 말)
+for done in (T, "안녕하세요.", "01079044351", "010-4957-6966입니다.", "01018167368 반품회수해갔다네요", "아 넵 감사합니다"):   # 이미 끝난 말을 hold 로 봐도 따르지 않는다: 규칙(800ms)
+    ms, heard, h = waited(done, hold);               assert ms == server.END_SILENCE_MS, (done, ms)
 ms, heard, h = waited(T, lambda b: Resp({}, 500));   assert ms == server.END_SILENCE_MS and heard["eot"]["errors"] > 0     # Jev 오류 → 예전 규칙 800ms
 ms, heard, h = waited(T, lambda b: choice("turn", "end", 0.5, ("hold",)));  assert ms == server.END_SILENCE_MS             # 확신 낮음 → 800ms
 ms, heard, h = waited("배송 확인하고 싶은데", end);  assert ms == server.LONG_SILENCE_MS, ms                                   # Jev 가 end 여도 '~는데'로 끝나면 규칙(1.8초)

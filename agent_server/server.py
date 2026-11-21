@@ -106,6 +106,7 @@ FILLERS = ["네, 확인해 보겠습니다.", "네, 바로 확인해 볼게요."
 # 그 말이 나가는 2~3초 동안 LLM 답과 음성이 만들어지고, 끝나면 본 답이 이어지며, 끝맺음 말이 붙는다. 먼저 하는 말·끝맺음 말은 warm_up 이 미리 음성으로 만들어 둔다.
 # 먼저 하는 말은 결과를 약속하지 않는 '이해했다는 표시' 한 문장(질문·숫자 없음)이라, LLM 이 어떤 답을 하든 어색하지 않다.
 MACRO = os.getenv("MACRO", "1") == "1"                    # 0 이면 매크로를 끈다 (전후 비교용)
+OPENER = os.getenv("OPENER", "1") == "1"                  # 0 이면 일반 첫마디를 끈다 (아래 pick_opener)
 SKIP_RE = re.compile(r"상담원|통화|전화\s*(주|해|요청)|불편|부작용|아프|아파|알레르기|두드러기|복용\s*중|먹고\s*있|약을|치료|증상|일째|변을|변비|설사|두통|어지|구토|통증"
                      r"|잘못|오배송|누락|빠졌|파손|불량|분실|못\s*받|안\s*왔|왜.*왔|화나|짜증|사기|항의|신고|광고")   # 사람 상담원에게 넘기거나 조심해야 할 말은 매크로 없이 LLM 이 판단한다
 CASES = {   # 유형: (키워드, 번호가 있어야 쓰는지, 먼저 하는 말 변형, 끝맺음 말을 붙이는지). 키워드가 정확히 한 유형에만 걸릴 때만 쓴다
@@ -360,6 +361,8 @@ async def listen(ws, stt, pace_on=False, profile=None, judge=None, router=None, 
                 if judge:
                     judge.tick(text, silent_ms)              # Jev 에게 "지금 답해도 되나(end)/더 기다려야 하나(hold)" 묻는다 (답은 비동기로 온다)
                     verdict = judge.verdict(text, silent_ms)
+                    if verdict == "hold" and hold_ignored(text):
+                        verdict = None                       # 끝난 말(인사·완결 번호·문장부호로 끝남)을 hold 로 본 것은 따르지 않는다: 2.5초를 괜히 기다리게 된다
                 if router and silent_ms >= jev.CASE_EARLY_MS:
                     router.speculate(text)                   # 말 끝 판정을 기다리는 동안 업무를 미리 분류해 둔다
             wait_ms, info = END_SILENCE_MS, None
@@ -927,6 +930,25 @@ _THANKS = (r"(?:감사(?:합니다|해요|드립니다|드려요|했습니다|�
 CLOSING_RE = re.compile(rf"^{_FILLER}*{_ADVERB}*{_THANKS}(?:{_FILLER}|{_ADVERB}|{_THANKS})*$")
 
 
+def hold_ignored(text):
+    """Jev 가 hold(말이 더 이어질 것)라고 해도 따르지 않을 만큼 '이미 끝난' 글인가. hold 를 따르면 무음을 2.5초까지 기다려 첫 소리가 크게 늦어진다.
+    (연습 80문항 실측: hold 9% 중 인사·완결 번호·'~했다네요' 같은 끝난 말이 섞여 있었고, 인사는 무음 길이와 상관없이 늘 hold 0.95 이상이었다)
+    끝난 글: 인사·감사만 / 번호를 다 말함(10자리 이상) / 문장부호나 ~요·~다·~죠·~까 로 끝남. 단 '~는데요'처럼 이어질 모양이거나 번호를 덜 말했으면 hold 를 따른다."""
+    t = (text or "").strip()
+    core = t.rstrip(".,?!…~ ")
+    if not core:
+        return False
+    flat = re.sub(r"[\s.,!?~…]+", "", t)
+    if GREETING_RE.match(flat) or CLOSING_RE.match(flat):
+        return True
+    m = DIGITS_TAIL.search(core)
+    if m:
+        return sum(c.isdigit() for c in m.group(1)) >= 10
+    if core.endswith(CONTINUING) or core.endswith(jev.OPEN_ENDS):
+        return False
+    return t[-1] in ".?!" or core.endswith(("요", "다", "죠", "까"))
+
+
 def greeting_reply(text, start):
     """손님 말이 인사만(처음), 또는 감사·끝인사만(상담 끝)이면 정해 둔 답 문장을, 아니면 None. 다른 말이 조금이라도 섞이면 None (LLM 이 처리).
     - 인사: 이 통화의 첫 말일 때만. - 감사: 상담원이 한 말이 있고, 그 말이 손님에게 답을 기다리는 질문이 아닐 때만.
@@ -962,6 +984,21 @@ def pick_case(text, start, decision=None):
     before = " ".join(h.get("text") or "" for h in start.get("history") or [] if h.get("role") == "agent")
     ready = [p for p in intros if p not in before and phrase_key(p) in FIXED]
     return (random.choice(ready), closing) if ready else None
+
+
+def pick_opener(text, start, decision=None):
+    """유형 매크로(pick_case)가 안 걸린 말에도 말 끝 직후 미리 만든 짧은 첫마디("네, 확인해 보겠습니다.")를 먼저 내보낸다.
+    왜: 본 답은 LLM(약 0.9초) + 음성 합성(게이트웨이 2.3초 이상)이 끝나야 나와서 첫 소리가 4초대인데, 첫마디는 합성이 필요 없어 말 끝 판정 + 받아쓰기(약 1.0초) 직후 나간다 (첫 소리 만점은 1.5초).
+    돌려주는 값은 pick_case 와 같은 (먼저 하는 말, 끝맺음 여부=False) 또는 None. 아래는 첫마디가 어색한 말이라 쓰지 않는다:
+    짧은 말(대답·추임새) / 말 고치기 / 몸이 불편하다·상담원·불만처럼 조심할 말(SKIP_RE) / Jev 가 상담원 연결·오배송·배송지 변경·기타(잡담)로 본 말."""
+    flat = re.sub(r"[\s.,!?~…]+", "", text or "")
+    if not (OPENER and MACRO) or len(flat) < 6 or SKIP_RE.search(text) or CORRECTING.search(text.strip()):
+        return None
+    if decision and decision.case_id and (decision.case_id in jev.NO_MACRO or decision.case_id == "other"):
+        return None
+    before = " ".join(h.get("text") or "" for h in start.get("history") or [] if h.get("role") == "agent")
+    ready = [p for p in FILLERS if p not in before and phrase_key(p) in FIXED]          # 이미 만들어 둔 채움말(FILLERS)을 쓴다: 같은 통화에서 한 말은 피한다
+    return (random.choice(ready), False) if ready else None
 
 
 def with_closing(reply, closing):
@@ -1001,7 +1038,7 @@ async def respond(ws, start, stt, tools, lap, heard=None, router=None, profile=N
         print(f"[{cid}] Jev 업무: {decision.short()}", flush=True)
     if start.get("debug"):                                    # 시험기에게 받아쓴 글을 바로 알려 준다 (손님이 말을 끊어도 어떤 말이었는지 기록할 수 있게)
         await ws.send(json.dumps({"type": "debug.heard", "customer": text}, ensure_ascii=False))
-    macro = pick_case(text, start, decision)                  # (먼저 하는 말, 끝맺음 여부) 또는 None
+    macro = pick_case(text, start, decision) or pick_opener(text, start, decision)   # (먼저 하는 말, 끝맺음 여부) 또는 None. 유형 매크로가 없으면 일반 첫마디
     intro = asyncio.create_task(say(ws, macro[0])) if macro else None   # 고정 음성이라 바로 나간다. 그동안 아래에서 LLM 이 생각한다
 
     async def filler():
