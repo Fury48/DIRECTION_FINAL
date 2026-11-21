@@ -88,7 +88,11 @@ NOT_HEARD = "잘 못 들었습니다. 다시 한번 말씀해 주시겠어요?"
 SORRY = "죄송합니다. 잠시 문제가 생겨 바로 답변드리기 어렵습니다."
 # 자주 쓰는 말은 서버를 켤 때 미리 음성으로 만들어 둔다 (Gemini 가 목소리를 만드는 데 몇 초가 걸려서).
 # LLM 이 아래 문장을 그대로 말하면 만드는 시간 없이 바로 나간다. 매뉴얼에 정해진 문구가 있으면 여기를 고칠 것.
+GREETING_REPLY = "네 안녕하세요, 무엇을 도와드릴까요?"          # 손님이 처음에 인사만 했을 때
+CLOSING_REPLY = "네 감사합니다. 좋은 하루 보내시길 바랍니다."      # 상담이 끝나 갈 때 손님이 감사·끝인사만 했을 때
 PHRASES = {
+    "손님이 처음에 인사만 했을 때 ('안녕하세요')": GREETING_REPLY,
+    "손님이 상담 끝에 감사·끝인사만 했을 때 ('감사합니다', '수고하세요')": CLOSING_REPLY,
     "손님이 방금 한 말을 고치려 하거나('잘못 얘기했는데', '아니 그게 아니라') 말을 이어 가려는 듯 아직 덜 한 것 같을 때": "네, 말씀하세요.",
     "주문번호나 전화번호가 필요한데 [통화 정보]에도 이전 대화에도 없을 때": "확인 도와드릴게요. 주문번호나 주문하신 분 전화번호를 말씀해 주시겠어요?",
     "손님이 몸이 불편하다·부작용이 있다고 말해 상담원 연결이 필요할 때 (브랜드 정보에 해당 안내 문구가 있으면 그 문구를 따른다)": "걱정되시겠어요. 바로 상담원 연결을 도와드리겠습니다.",
@@ -914,6 +918,33 @@ def has_number(text, start):
     return bool(start.get("caller")) or any(h.get("role") == "tool_result" for h in history) or sum(c.isdigit() for c in said) >= 7 or "공일공" in said
 
 
+# ── 앞뒤 인사: 인사·감사만 한 말은 LLM 을 거치지 않고 미리 만들어 둔 음성으로 바로 답한다 (가장 빠르고, 말이 늘 같다) ──
+_FILLER = r"(?:아하|아|어|음|네|넵|예|그래요|알겠습니다|알겠어요|좋아요|됐어요|괜찮아요|그렇군요|오케이)"
+_ADVERB = r"(?:정말|너무|진짜|많이|도와주셔서|덕분에|친절하게|친절히|잘|그럼요|그럼)"
+GREETING_RE = re.compile(rf"^{_FILLER}*(?:안녕하세요|안녕하십니까|안녕하세여|하이|여보세요|저기요)(?:하루온(?:입니까|인가요|이죠|이에요|맞나요|입니다)?|고객센터(?:인가요|죠|맞나요)?)?요?$")
+_THANKS = (r"(?:감사(?:합니다|해요|드립니다|드려요|했습니다|했어요)|고맙(?:습니다|네요|어요)|고마워요|수고(?:하세요|하십시오|하셨습니다|많으셨어요)|고생(?:하세요|하셨습니다|많으셨어요)"
+           r"|안녕히(?:계세요|계십시오|가세요)|들어가세요|좋은하루(?:되세요|보내세요|되십시오))")
+CLOSING_RE = re.compile(rf"^{_FILLER}*{_ADVERB}*{_THANKS}(?:{_FILLER}|{_ADVERB}|{_THANKS})*$")
+
+
+def greeting_reply(text, start):
+    """손님 말이 인사만(처음), 또는 감사·끝인사만(상담 끝)이면 정해 둔 답 문장을, 아니면 None. 다른 말이 조금이라도 섞이면 None (LLM 이 처리).
+    - 인사: 이 통화의 첫 말일 때만. - 감사: 상담원이 한 말이 있고, 그 말이 손님에게 답을 기다리는 질문이 아닐 때만.
+    - 답의 음성이 아직 준비되지 않았으면 None (지금 만들면 오히려 느리다)."""
+    flat = re.sub(r"[\s.,!?~…]+", "", text or "")                 # 띄어쓰기·문장부호 차이는 무시 ("아 넵 감사합니다." = "아넵감사합니다")
+    history = [h for h in start.get("history") or [] if h.get("role") in ("customer", "agent")]
+    if not flat or not history and not GREETING_RE.match(flat):
+        return None
+    if not history:
+        reply = GREETING_REPLY
+    else:
+        asked = next((h.get("text") or "" for h in reversed(history) if h.get("role") == "agent"), None)
+        if asked is None or "?" in asked[-60:] or not CLOSING_RE.match(flat):
+            return None                                           # 상담원이 한 말이 없거나, 방금 질문했거나(감사가 대답이 아님), 다른 말이 섞임
+        reply = CLOSING_REPLY
+    return reply if all(phrase_key(unit) in FIXED for unit in sentences(for_tts(reply))) else None
+
+
 def pick_case(text, start, decision=None):
     """이번 손님 말의 유형을 키워드로 정해 (먼저 하는 말, 끝맺음 말을 붙일지) 를 돌려준다. 확실하지 않으면 None (잘못된 매크로는 없는 것보다 나쁘다).
     같은 통화에서 이미 한 말은 피하고, 음성이 미리 만들어져 있지 않은 문구는 쓰지 않는다 (지금 만들면 오히려 늦다).
@@ -952,6 +983,18 @@ async def respond(ws, start, stt, tools, lap, heard=None, router=None, profile=N
             print(f"[{cid}] 느린 말투 → 상담원 재생 {speed}배, 문장 사이 쉼 {round(PACE_PLAY_GAP_MS / speed)}ms", flush=True)
         if heard:
             profile.note_rate(turn_rate(text, heard["voiced_ms"]))
+    if reply := greeting_reply(text, start):                  # 인사만 / 감사·끝인사만: LLM·업무 분류·매크로 없이 미리 만든 음성으로 바로 답한다
+        if start.get("debug"):                                # 시험기에게도 다른 답과 같은 신호를 보낸다 (함수 호출은 없으므로 history_add 는 비어 있다)
+            await ws.send(json.dumps({"type": "debug.heard", "customer": text}, ensure_ascii=False))
+            await ws.send(json.dumps({"type": "debug.turn", "customer": text, "history_add": []}, ensure_ascii=False))
+        if VERBOSE:
+            print(f"[{cid}] 고객: {text}\n[{cid}] 상담원: {reply} (인사 응대)", flush=True)
+        else:
+            print(f"[{cid}] 인사 응대", flush=True)
+        lap("인사 응대")
+        await say(ws, reply, lap)
+        lap("말하기 끝")
+        return
     decision = await router.resolve(text) if router and text else None   # Jev 업무 분류: 말하는 동안 미리 물어 둔 결과를 쓰고, 없으면 최대 CASE_WAIT_S 만 기다린다
     if decision:
         lap("업무 분류")
