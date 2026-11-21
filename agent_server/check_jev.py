@@ -31,11 +31,11 @@ clear_keys()
 os.environ.pop("BAZE_API_KEY", None)
 assert jev.target() == (None, None, None) and not any(jev.active(m, {"debug": True}) for m in ("auto", "jev", "live", "off"))   # 키가 없으면 어떤 모드든 꺼짐
 os.environ["BAZE_API_KEY"] = "bkey"
-assert jev.target() == ("https://api.baze.co/v1/gateway/decisions/", "bkey", "jev-latest")                                  # 제출용: 게이트웨이
+assert jev.target() == ("https://api.baze.co/v1/gateway/decisions/", "bkey", "jev-1.14.0")                                  # 제출용: 게이트웨이
 assert (jev.active("auto"), jev.active("jev"), jev.active("live"), jev.active("live", {"debug": True}), jev.active("off"), jev.active("silence")) \
     == (False, True, False, True, False, False)                                                                              # auto 는 TYPESAFE 키가 있을 때만
 os.environ["TYPESAFE_API_KEY"] = " tkey "
-assert jev.target() == ("https://api.typesafe.ai/v1/systemone", "tkey", "jev-latest") and jev.active("auto")                # 키 한 줄이면 바로 켜짐 (직접 호출이 우선)
+assert jev.target() == ("https://api.typesafe.ai/v1/systemone", "tkey", "jev-1.14.0") and jev.active("auto")                # 키 한 줄이면 바로 켜짐 (직접 호출이 우선)
 assert not jev.active("silence") and not jev.active("off")
 
 
@@ -84,7 +84,7 @@ h = FakeHttp(lambda j: choice("turn", "end"))
 ans = run(jev.ask(h, {"caller_transcript": "가"}, {"turn": jev.TURN_QUESTION}, 1.0))
 url, headers, body, timeout = h.sent[0]
 assert url.endswith("/v1/systemone") and headers == {"Authorization": "Bearer tkey"} and timeout == 1.0
-assert set(body) == {"model", "state", "questions"} and body["model"] == "jev-latest"                                         # 게이트웨이는 이 세 개 말고 다른 필드를 주면 400
+assert set(body) == {"model", "state", "questions"} and body["model"] == "jev-1.14.0"                                         # 게이트웨이는 이 세 개 말고 다른 필드를 주면 400
 assert body["questions"]["turn"]["type"] == "choice" and set(body["questions"]["turn"]["criteria"]) == {"end", "hold"} and ans["turn"]["choice"] == "end"
 
 reset()

@@ -11,7 +11,7 @@
 준비:  pip install -r requirements.txt
        agent_server/.env 에 BAZE_API_KEY (대회 게이트웨이 키 하나로 셋 다) 또는 OPENAI_API_KEY, SONIOX_API_KEY, GEMINI_API_KEY 를 적는다 (.env.example 을 복사해서 사용)
 """
-import argparse, asyncio, contextvars, hashlib, json, math, os, random, re, time
+import argparse, asyncio, contextvars, difflib, hashlib, json, math, os, random, re, time
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -57,7 +57,18 @@ PHRASE_DIR = Path(__file__).with_name("phrases")          # 고정 문구 음성
 
 RATE, FRAME = 16000, 640            # 대회 규격: 16kHz 16-bit mono, 20ms = 640바이트
 SPEECH_RMS = int(os.getenv("SPEECH_RMS", 500))            # 볼륨이 이보다 크면 말소리
-END_SILENCE_MS = int(os.getenv("END_SILENCE_MS", 800))    # 말소리 뒤 이만큼 조용하면 말이 끝난 것
+END_SILENCE_MS = int(os.getenv("END_SILENCE_MS", 1000))   # 문장부호 없는 말: 이만큼 조용하면 말이 끝난 것 (0.8초는 연습 음성의 긴 문장 중간 쉼에 걸림. 첫마디가 바로 나가서 1.0초여도 첫 소리 1.5초 안)
+PUNCT_SILENCE_MS = int(os.getenv("PUNCT_SILENCE_MS", 1000))          # 문장부호로 끝난 말 (측정)
+LIVE_PUNCT_SILENCE_MS = int(os.getenv("LIVE_PUNCT_SILENCE_MS", 800))  # 문장부호로 끝난 말 (시험기·시연)
+NOUN_SILENCE_MS = int(os.getenv("NOUN_SILENCE_MS", 2000))            # 서술어 없는 명사로 끝난 짧은 말 (측정)
+LIVE_NOUN_SILENCE_MS = int(os.getenv("LIVE_NOUN_SILENCE_MS", 1000))
+COMMA_SILENCE_MS = int(os.getenv("COMMA_SILENCE_MS", 2400))          # 쉼표·말줄임으로 끝난 말
+PREAMBLE_SILENCE_MS = int(os.getenv("PREAMBLE_SILENCE_MS", 1600))    # 인사·머뭇거림뿐인 말
+SENT_END = re.compile(r"[.?!。？！]\s*$")
+VERB_END = re.compile(r"(요|다|까|죠|니다|세요|어|아|해|네|군|지|래|나|가|고|서|데|라|자|게|걸|냐|니)$")
+PREAMBLE_WORDS = {"안녕하세요", "안녕하십니까", "여보세요", "저기요", "저기", "네", "예", "넵", "음", "어", "그", "아", "저", "수고하십니다", "상담원님"}
+CORRECTING_ONLY = re.compile(r"^(?:(?:음|어|아|저|네|그)[\s,.…]*)?(?:잘못\s*(?:말|얘기|이야기)\S*|아니(?:\s*아니)*|아냐|잠깐(?:만요|만)?|잠시만(?:요)?|"
+                             r"다시\s*(?:말할게요|말씀드릴게요|말할게|불러\s*드릴게요)|그게\s*아니(?:라|고)?)[\s,.…!?~]*$")
 MIN_SPEECH_MS = 200                 # 이보다 짧은 소리(잡음)는 말로 치지 않는다
 LONG_SILENCE_MS = int(os.getenv("LONG_SILENCE_MS", 1800))  # 말이 '~는데', '~하고' 처럼 이어질 모양으로 멈췄을 땐 이만큼 더 기다린다 (END_SILENCE_MS 와 같게 두면 끔)
 CONTINUING = ("는데", "은데", "인데", "하고", "했고", "였고", "이고", "있고", "없고", "싶고", "해서", "어서", "아서", "라서",
@@ -197,15 +208,34 @@ class Stt:
         tail = (self.text + self.partial).strip().rstrip(".,?!…~ ")
         return tail.endswith(CONTINUING)
 
-    def wait_ms(self):
-        """말이 멈춘 뒤 '끝났다'고 보기까지 기다릴 시간(ms). 사람은 말을 고치거나 번호를 떠올릴 때 오래 쉬어서, 이럴 땐 더 기다려야 말 도중에 끼어들지 않는다."""
-        tail = (self.text + self.partial).strip().rstrip(".,?!…~ ")
-        if len(tail) <= 20 and CORRECTING.search(tail):          # "잘못 얘기했는데", "아니 그게…", "잠깐만요" 같은 정정 시작 말: 한참 생각하고 이어 말한다
-            return CORRECT_SILENCE_MS
-        digits = DIGITS_TAIL.search(tail)
-        if digits and sum(c.isdigit() for c in digits.group(1)) < 10:   # 번호(010 … 4957 …)를 말하다 쉬는 중: 전화번호는 11자리. 받아쓰기는 마지막 글자가 한 박자 늦게 나와 "01"까지만 보일 수 있어 1자리부터 센다
-            return LONG_SILENCE_MS
-        return LONG_SILENCE_MS if tail.endswith(CONTINUING) else END_SILENCE_MS
+    def rule(self, live=False):
+        """(기다릴 시간 ms, 규칙 이름). 문장부호가 찍힌 말은 Jev 보다 이 규칙을 따른다 (검토 1·2-1절, voice_agent 실측).
+        punct·plain 만 '빨리 확정하는 규칙'이라 Jev end·말 속도 조절의 대상이다."""
+        raw = (self.text + self.partial).strip()
+        tail = raw.rstrip(".,?!…~ ")
+        last = [p for p in re.split(r"(?<=[.?!])\s+", raw) if p.strip()]
+        if last and CORRECTING_ONLY.match(last[-1].strip()):     # 마지막 문장이 정정하는 말뿐 ("아니,", "잠깐만요.", "잘못 말했어요."). "아니 배송이 왜 안 와요?"는 해당 없음
+            return CORRECT_SILENCE_MS, "correcting"
+        if raw.endswith((",", "，", "…", "-")):                   # 쉼표·말줄임으로 끝남: 이어 말하는 중
+            return COMMA_SILENCE_MS, "comma"
+        m = DIGITS_TAIL.search(tail)
+        d = re.sub(r"\D", "", m.group(1)) if m else ""
+        if d and (len(d) < 10 or (d.startswith("20") and len(d) < 15)):   # 번호를 말하다 쉬는 중 (전화 11자리, 주문 15자리)
+            return LONG_SILENCE_MS, "partial_number"
+        if tail.endswith(CONTINUING):
+            return LONG_SILENCE_MS, "connective"
+        words = [w for w in re.split(r"[\s.,?!…~]+", tail) if w]
+        if words and all(w in PREAMBLE_WORDS for w in words):     # 인사·머뭇거림뿐: 본론이 이어지는 경우가 많다
+            return PREAMBLE_SILENCE_MS, "preamble"
+        if SENT_END.search(raw):
+            if not raw.endswith("?") and len(re.sub(r"\D", "", tail)) < 7 and len(re.sub(r"\s", "", tail)) <= 14 and not VERB_END.search(tail):
+                return (LIVE_NOUN_SILENCE_MS if live else NOUN_SILENCE_MS), "noun"   # 서술어 없는 명사로 끝난 짧은 말 ('대장영양제.'): 이어 말할 수 있다
+            return (LIVE_PUNCT_SILENCE_MS if live else PUNCT_SILENCE_MS), "punct"
+        return END_SILENCE_MS, "plain"
+
+    def wait_ms(self, live=False):
+        """말이 멈춘 뒤 '끝났다'고 보기까지 기다릴 시간(ms)."""
+        return self.rule(live)[0]
 
     async def finish(self):
         self.queue.put_nowait(json.dumps({"type": "finalize"}))
@@ -362,12 +392,14 @@ async def listen(ws, stt, pace_on=False, profile=None, judge=None, router=None, 
                     verdict = judge.verdict(text, silent_ms)
                 if router and silent_ms >= jev.CASE_EARLY_MS:
                     router.speculate(text)                   # 말 끝 판정을 기다리는 동안 업무를 미리 분류해 둔다
-            wait_ms, info = END_SILENCE_MS, None
-            if silent_ms >= (jev.EOT_END_MS if verdict == "end" else END_SILENCE_MS):
-                wait_ms = stt.wait_ms()
-                if wait_ms == END_SILENCE_MS:                # 이어질 말투·번호·말 고치기 같은 규칙이 없는 보통 말
+            info = None
+            wait_ms, rule = stt.rule(live)
+            if rule == "punct":
+                verdict = None                               # 문장부호로 끝난 말은 Jev 보다 규칙 (Jev 가 끝난 질문을 hold 로 봐 첫 소리가 늦어짐: voice_agent 실측)
+            if silent_ms >= min(wait_ms, jev.EOT_END_MS if verdict == "end" else wait_ms):
+                if rule in ("punct", "plain"):               # 이어질 말투·번호·말 고치기 같은 규칙이 없는 보통 말
                     if verdict == "end":
-                        wait_ms = jev.EOT_END_MS             # Jev 가 끝났다고 보면 650ms 만에 끊는다 (규칙이 '더 기다려라' 하면 규칙을 따른다: 끊는 쪽 실수는 속도 0점이라)
+                        wait_ms = jev.EOT_END_MS             # Jev 가 끝났다고 보면 EOT_END_MS 에 끊는다 (규칙이 '더 기다려라' 하면 규칙을 따른다: 끊는 쪽 실수는 속도 0점이라)
                     elif pace_on and profile is not None:    # 빨리 확정하는 기본 규칙에만 말 속도 조절을 적용한다
                         rate = turn_rate(text, voiced_ms) or profile.rate   # 이번 말로 못 재면 통화 누적값. (받아쓰기 글은 소리보다 늦게 와서 말하는 도중엔 속도가 실제보다 느리게 나오지만, 상한 배율이 막아 준다)
                         own = max(max(pauses, default=0), profile.pause_hint())    # 이번 말 중간의 쉼, 지난번에 끼어들며 배운 쉼 중 큰 쪽
@@ -419,7 +451,7 @@ async def load_tools(start):
         return []
 
 
-def check_args(name, args, tools):
+def check_args(name, args, tools, ctx=None):
     """문지기: 함수를 부르기 전에 검사한다. 문제가 있으면 이유(문자열)를, 괜찮으면 None을 돌려준다."""
     spec = next((t["function"] for t in tools if t["function"]["name"] == name), None)
     if spec is None:
@@ -431,16 +463,83 @@ def check_args(name, args, tools):
         missing = ["order_id 또는 buyer_cellphone"]               # 주문 조회는 필수 값이 없지만 번호 하나는 있어야 한다
     if missing:
         return f"필요한 값이 없습니다: {', '.join(missing)}. 고객에게 먼저 물어보세요."
+    return check_numbers(name, args, ctx or {})
+
+
+EXAMPLE_PHONES = {"01012345678", "01000000000", "01012341234", "01000001234", "01011112222", "01022223333", "01033334444", "01044445555", "01055556666"}
+CANCELLED = ("취소완료", "입금전취소")
+
+
+def _digits(v):
+    return re.sub(r"\D", "", str(v)) if v not in (None, "") else ""
+
+
+def valid_phone(v):
+    d = _digits(v)
+    return len(d) == 11 if d.startswith("010") else (9 <= len(d) <= 11 and d.startswith("0"))
+
+
+def valid_order_id(v):
+    """하루온 주문번호: YYYYMMDD + 7자리 (예: 20261101-0001234)."""
+    d = _digits(v)
+    return len(d) == 15 and d.startswith("20") and 1 <= int(d[4:6]) <= 12 and 1 <= int(d[6:8]) <= 31
+
+
+def call_context(start, results=()):
+    """번호 검사에 쓰는 근거: 발신자·이전 대화에 나온 번호, 조회된 주문번호, 취소된 주문번호."""
+    ctx = {"phones": set(), "orders": set(), "cancelled": set()}
+    caller = start.get("caller")
+    for v in (caller.values() if isinstance(caller, dict) else [caller]):
+        if valid_phone(v):
+            ctx["phones"].add(_digits(v))
+    for h in start.get("history") or []:
+        if h.get("role") == "customer":
+            ctx["phones"].update(_digits(m.group(0)) for m in PHONE_RE.finditer(h.get("text") or ""))
+    items = [(h.get("name"), h.get("result")) for h in start.get("history") or [] if h.get("role") == "tool_result"] + list(results)
+    lines = {}
+    for name, res in items:
+        data = res.get("data") if isinstance(res, dict) else None
+        if name != "get_order_info" or not isinstance(data, dict):
+            continue
+        for o in data.get("orders") or []:
+            no = _digits(o.get("주문번호"))
+            if no:
+                ctx["orders"].add(no)
+                lines.setdefault(no, []).append(o.get("배송상태") in CANCELLED)
+    ctx["cancelled"] = {no for no, flags in lines.items() if flags and all(flags)}
+    return ctx
+
+
+def check_numbers(name, args, ctx):
+    """번호가 깨져 들린 채로 조회·접수하면 틀린 호출이 된다 (voice_agent toolflow.block_reason). 문제가 없으면 None."""
+    for k in ("buyer_cellphone", "customer_phone_number", "phone_number"):
+        d = _digits(args.get(k))
+        if d and d in EXAMPLE_PHONES and d not in ctx.get("phones", ()):
+            return "전화번호가 정확히 들리지 않았습니다(예시 번호). 호출하지 않았습니다. 휴대폰 번호 11자리를 한 자리씩 천천히 다시 여쭙니다."
+    if name == "get_order_info":
+        ph, oid = args.get("buyer_cellphone"), args.get("order_id")
+        if not ((ph and valid_phone(ph)) or (oid and (valid_order_id(oid) or _digits(oid) in ctx.get("orders", ())))):
+            return "번호가 정확히 들리지 않았습니다(전화번호 11자리 또는 주문번호 YYYYMMDD-7자리가 아님). 조회하지 않았습니다. 번호를 한 자리씩 천천히 다시 여쭙니다."
+    if name in ("get_return_info", "request_callback"):
+        k = "customer_phone_number" if name == "get_return_info" else "phone_number"
+        if not valid_phone(args.get(k)):
+            return "전화번호가 정확히 들리지 않았습니다. 호출하지 않았습니다. 휴대폰 번호 11자리를 한 자리씩 천천히 다시 여쭙니다."
+    if name in ("cancel_order", "return_order", "exchange_order"):
+        v = args.get("order_id" if name == "cancel_order" else "order_number")
+        if not (valid_order_id(v) or _digits(v) in ctx.get("orders", ())):
+            return "주문번호가 정확하지 않습니다. 접수하지 않았습니다. 주문 조회로 먼저 확인하거나 주문번호를 다시 여쭙니다."
+        if name != "cancel_order" and _digits(v) in ctx.get("cancelled", ()):
+            return "취소된 주문은 반품·교환 대상이 아닙니다. 접수하지 않았습니다. 이미 취소된 주문이라 반품·교환할 수 없다고 안내합니다."
     return None
 
 
-def parse_call(call, tools, masker):
+def parse_call(call, tools, masker, ctx=None):
     """LLM 의 함수 호출을 해석(자리표시는 원래 번호로 되돌림)하고 문지기 검사를 한다. (인수, 문제) 를 돌려준다. 문제가 없으면 문제 자리는 None."""
     try:
         args = json.loads(masker.unmask(call.function.arguments or "{}"))
     except ValueError:
         return None, "arguments가 올바른 JSON이 아닙니다"
-    return args, check_args(call.function.name, args, tools)
+    return args, check_args(call.function.name, args, tools, ctx)
 
 
 async def run_tool(start, name, args, problem):
@@ -541,7 +640,7 @@ def history_messages(history):
     return out
 
 
-def system_prompt(start, said="", decision=None):
+def system_prompt(start, said="", decision=None, closing=True):
     fixed ="\n\n[고정 문장]\n아래 상황에서는 해당 문장을 한 글자도 바꾸지 말고 그 문장만 말한다.\n" + "\n".join(
         f"- {when}: {line}" for when, line in PHRASES.items())
     info = f"\n\n[통화 정보]\n현재 시각: {start.get('now')}"        # 통화마다 달라지는 내용은 맨 끝에 둔다 (앞부분이 같아야 LLM 이 캐시를 쓴다)
@@ -549,7 +648,7 @@ def system_prompt(start, said="", decision=None):
         info += f"\n발신자 정보(걸려 온 번호로 찾은 회원. 다른 번호로 주문했을 수 있으니 조회가 안 되면 다른 번호를 여쭙는다): {json.dumps(start['caller'], ensure_ascii=False)}"
     if said:                                                         # 매크로가 이미 나간 통화: 같은 말을 되풀이하지 않게 알려 준다
         info += (f"\n서버가 방금 손님에게 먼저 한 말: \"{said}\" 이 말은 되풀이하지 말고 결과·본론부터 답한다. "
-                 "'확인해 볼게요' 같은 말과 끝인사('더 궁금하신 점…')는 쓰지 않는다 (끝인사는 서버가 붙인다).")
+                 "'확인해 볼게요' 같은 말과 끝인사('더 궁금하신 점…')는 쓰지 않는다" + (" (끝인사는 서버가 붙인다)." if closing else "."))
     if decision and decision.guide:                                  # Jev 가 업무를 가려냈으면 그 업무의 지침(scenarios.md 해당 구역)을 한 번 더 붙인다
         info += f"\n[이번 통화의 업무: {decision.name}] 손님의 말이 이 업무로 분류됐다. 아래 지침을 우선 따른다 (다른 업무가 분명하면 그 업무 지침을 따른다).\n{decision.guide}"
     return PROMPT + fixed + info
@@ -562,26 +661,29 @@ def llm_options(tools=None):
     return options
 
 
-async def think(start, text, tools, filler=None, trace=None, said="", decision=None):
+async def think(start, text, tools, filler=None, trace=None, said="", decision=None, closing=True):
     """LLM 에게 묻는다. 함수를 부르면 전산실에 물어보고 그 결과로 다시 묻는다. filler 는 함수를 부를 때 먼저 한마디 하는 함수 (말한 문장을 돌려줌).
     trace 가 리스트면 실제로 부른 함수와 결과를 history 형식으로 담는다 (시험기 live_chat.py 용)."""
     masker = Masker()
-    messages = [{"role": "system", "content": system_prompt(start, said, decision)},
+    messages = [{"role": "system", "content": system_prompt(start, said, decision, closing)},
                 *history_messages(start.get("history")),
                 {"role": "user", "content": text}]
+    done = []                                                 # 이번 답에서 받은 함수 결과 (번호 검사 근거)
     for round_no in range(MAX_TOOL_ROUNDS + 1):
         resp = await ai.chat.completions.create(model=LLM_MODEL, messages=mask_messages(masker, messages), **llm_options(tools))
         count_llm(resp)
         msg = resp.choices[0].message
         if not msg.tool_calls:
             return masker.unmask((msg.content or "").strip()) or SORRY
-        checked = [parse_call(c, tools, masker) for c in msg.tool_calls]
+        ctx = call_context(start, done)
+        checked = [parse_call(c, tools, masker, ctx) for c in msg.tool_calls]
         said = await filler() if filler and round_no == 0 and any(problem is None for _, problem in checked) else None
         messages.append({"role": "assistant", "content": said or msg.content, "tool_calls": [
             {"id": c.id, "type": "function", "function": {"name": c.function.name, "arguments": c.function.arguments}}
             for c in msg.tool_calls]})
         results = await asyncio.gather(*(run_tool(start, c.function.name, *p) for c, p in zip(msg.tool_calls, checked)))
         for call, result in zip(msg.tool_calls, results):
+            done.append((call.function.name, result))
             messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result, ensure_ascii=False)})
         if trace is not None:
             for call, (args, problem), result in zip(msg.tool_calls, checked, results):
@@ -964,6 +1066,38 @@ def pick_case(text, start, decision=None):
     return (random.choice(ready), closing) if ready else None
 
 
+# 첫마디: 말 끝 확정 직후 바로 내는 녹음 한마디 (결과를 약속하지 않는 말). 앞쪽은 새로 만들 문구, 뒤쪽은 이미 phrases/ 에 있는 문구라 바로 쓸 수 있다
+OPENERS = {
+    "empathy": ["불편을 드려 죄송합니다.", "많이 불편하셨겠어요.", "걱정되시겠어요."],
+    "ack_check": ["네, 확인해 드리겠습니다.", "네, 확인 도와드릴게요.", "네, 확인해 보겠습니다.", "네, 바로 확인해 볼게요."],
+    "neutral_info": ["네, 안내해 드리겠습니다.", "네, 말씀드리겠습니다.", "네, 해당 내용 바로 안내해 드릴게요."],
+    "neutral": ["네, 고객님.", "네, 알겠습니다."],
+}
+UPSET_RE = re.compile(r"왜|화나|짜증|불편|아직도|언제까지|몇\s*번|오배송|누락|파손|불량|잘못\s*(왔|온|배송)")
+
+
+def pick_opener(text):
+    """첫마디 문장. 음성이 준비된 것이 없거나, 짧은 말 고치기·대답이면 None (예전처럼 LLM 답만)."""
+    if CORRECTING_ONLY.match(text.strip()) or len(re.sub(r"[\s.,?!]", "", text)) < 4:
+        return None
+    kind = ("empathy" if UPSET_RE.search(text) else
+            "ack_check" if re.search(r"\d{4}|배송|주문|입금|환불|반품|취소|교환|조회|확인|택배|송장", text) else
+            "neutral_info" if re.search(r"효과|먹|섭취|복용|성분|가격|얼마|쿠폰|결제|카드|회원|방법|적립|배송비", text) else "neutral")
+    ready = [p for p in OPENERS[kind] if phrase_key(p) in FIXED]
+    return random.choice(ready) if ready else None
+
+
+def after_opener(reply, opener):
+    """첫마디 뒤 본 답: 앞의 '네,'와 첫마디와 거의 같은 첫 문장은 뺀다 ('네, 확인해 드리겠습니다. 확인 도와드릴게요.' 방지)."""
+    parts = [p for p in re.split(r"(?<=[.!?])\s+", reply.strip()) if p]
+    if len(parts) > 1 and difflib.SequenceMatcher(None, phrase_key(parts[0]), phrase_key(opener)).ratio() >= 0.6:
+        parts = parts[1:]
+    out = " ".join(parts)
+    if opener.startswith("네"):
+        out = re.sub(r"^\s*(네|예)\s*[,.!]\s*", "", out) or out
+    return out or reply
+
+
 def with_closing(reply, closing):
     """본 답이 끝난 일을 알리는 말이면 끝맺음 말을 붙인다 (되묻거나 넘기는 답, 사과에는 붙이지 않는다)."""
     if not closing or reply in (SORRY, NOT_HEARD) or NO_CLOSING_RE.search(reply):
@@ -1002,7 +1136,9 @@ async def respond(ws, start, stt, tools, lap, heard=None, router=None, profile=N
     if start.get("debug"):                                    # 시험기에게 받아쓴 글을 바로 알려 준다 (손님이 말을 끊어도 어떤 말이었는지 기록할 수 있게)
         await ws.send(json.dumps({"type": "debug.heard", "customer": text}, ensure_ascii=False))
     macro = pick_case(text, start, decision)                  # (먼저 하는 말, 끝맺음 여부) 또는 None
-    intro = asyncio.create_task(say(ws, macro[0])) if macro else None   # 고정 음성이라 바로 나간다. 그동안 아래에서 LLM 이 생각한다
+    opener = None if macro or not text else pick_opener(text) # 매크로가 없는 답에도 녹음 첫마디를 바로 낸다 (검토 2-1절: 함수 없는 답의 첫 소리)
+    first = macro[0] if macro else opener
+    intro = asyncio.create_task(say(ws, first, lap, "첫마디 전송")) if first else None   # 고정 음성이라 바로 나간다. 그동안 아래에서 LLM 이 생각한다
 
     async def filler():
         """함수 조회는 1~2초 걸리니, 그동안 미리 만들어 둔 짧은 한마디를 먼저 말한다 (첫 소리가 빨라짐). 아직 준비가 안 됐으면 None."""
@@ -1015,7 +1151,9 @@ async def respond(ws, start, stt, tools, lap, heard=None, router=None, profile=N
 
     trace = [] if start.get("debug") else None                # 시험기(live_chat.py)가 session.start 에 debug 를 켠 때만 쓴다. 측정기는 켜지 않는다
     try:
-        reply = await think(start, text, await tools, None if macro else filler, trace, macro[0] if macro else "", decision) if text else NOT_HEARD   # 매크로가 나갔으면 채움말은 또 하지 않는다
+        reply = await think(start, text, await tools, None if first else filler, trace, first or "", decision, closing=bool(macro and macro[1])) if text else NOT_HEARD   # 첫마디가 나갔으면 채움말은 또 하지 않는다
+        if opener:
+            reply = after_opener(reply, opener)
     except BaseException:
         if intro:
             intro.cancel()
@@ -1110,7 +1248,7 @@ async def warm_up():
         with suppress(Exception):
             count_llm(await ai.chat.completions.create(model=LLM_MODEL, messages=[{"role": "user", "content": "안녕하세요"}]))
 
-    lines = [NOT_HEARD, SORRY, *PHRASES.values(), *FILLERS, *[p for case in CASES.values() for p in case[2]], *CLOSINGS]
+    lines = [NOT_HEARD, SORRY, *PHRASES.values(), *FILLERS, *[p for case in CASES.values() for p in case[2]], *CLOSINGS, *[p for v in OPENERS.values() for p in v]]
     await asyncio.gather(llm(), *(fill(unit) for line in lines for unit in sentences(line)))
     print(f"[준비 완료] 미리 만든 고정 문구 음성 {len(FIXED)}개. 이제 테스트를 시작해도 돼요.", flush=True)
 

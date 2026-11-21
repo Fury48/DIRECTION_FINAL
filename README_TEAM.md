@@ -126,7 +126,8 @@ $env:PYTHONUTF8="1"; python eval/live_chat.py
 | 이름 | 기본값 | 설명 |
 |---|---|---|
 | `LLM_EFFORT` | (비움) | LLM 생각 강도 `low`/`medium` (높을수록 정확하지만 느림) |
-| `END_SILENCE_MS` | 800 | 이만큼 조용하면 말이 끝났다고 판단 (**줄이면 말 중간에 끼어들 위험**) |
+| `END_SILENCE_MS` | 1000 | 문장부호 없는 말: 이만큼 조용하면 말이 끝났다고 판단 (**줄이면 말 중간에 끼어들 위험**) |
+| `PUNCT_SILENCE_MS` / `NOUN_SILENCE_MS` / `COMMA_SILENCE_MS` / `PREAMBLE_SILENCE_MS` | 1000 / 2000 / 2400 / 1600 | 문장부호 끝 / 서술어 없는 짧은 명사 끝 / 쉼표·말줄임 끝 / 인사·머뭇거림뿐. 문장부호로 끝난 말은 Jev 보다 이 규칙을 따름 (시연은 문장부호 0.8초·명사 1.0초) |
 | `LONG_SILENCE_MS` | 1800 | 말이 `~는데`, `~하고`처럼 이어질 모양이거나, 번호를 다 말하지 않고(숫자 1~9자리) 쉴 때 더 기다리는 시간 |
 | `CORRECT_SILENCE_MS` | 2500 | "잘못 얘기했는데", "아니 그게…", "잠깐만요" 같은 말 고치기 시작 말 뒤에 더 기다리는 시간 |
 | `PACE_ADAPT` | live | 말이 느린 사람에게 대기(0.8초)를 늘리고 음성도 느리게 하는 기능 (`pace.md`). `off` 끔 / `live` 시험기·시연(session.start 에 debug)만 / `all` 측정 포함. **이전 말의 기록(call_id)이 있어야 발동해서 채점기에는 영향 없음** |
@@ -136,8 +137,8 @@ $env:PYTHONUTF8="1"; python eval/live_chat.py
 | `PACE_LEARN_MAX_MS` | 2000 | 말 끝 확정 뒤 이 시간 안에 이어 말하면 그 쉼을 배움 |
 | `TYPESAFE_API_KEY` | (비움) | **Jev 키. `agent_server/.env` 에 이 한 줄만 넣으면 말 끝 판정·업무 분류가 바로 켜집니다** (`JEV_HANDOFF.md`) |
 | `EOT_MODE` / `CASE_ROUTER` | auto | Jev 말 끝 판정 / 업무 분류. `auto` 는 **TYPESAFE_API_KEY 가 있을 때만** 켬 / `jev` 는 어떤 키든 켬(제출용: BAZE 게이트웨이로 부름) / `live` 는 시험기·시연(debug)만 / `off` 끔 |
-| `TYPESAFE_MODEL` | jev-latest | Jev 모델 이름 (게이트웨이 목록에는 `jev-1.14.0`·`jev-1.13.0` 도 있음) |
-| `EOT_END_MS` / `EOT_HOLD_MS` / `EOT_MIN_PROB` | 650 / 2500 / 0.75 | Jev 가 end 면 무음 650ms 에 끊고, hold 면 2.5초까지 기다림. 확신이 0.75 미만이면 안 씀 |
+| `TYPESAFE_MODEL` | jev-1.14.0 | Jev 모델 이름 (게이트웨이 목록에는 `jev-1.14.0`·`jev-1.13.0` 도 있음) |
+| `EOT_END_MS` / `EOT_HOLD_MS` / `EOT_MIN_PROB` | 1000 / 2500 / 0.75 | (문장부호 없는 말에만) Jev 가 end 면 무음 1000ms 에 끊고, hold 면 2.5초까지 기다림. 확신이 0.75 미만이면 안 씀 |
 | `CASE_PROMPT` | add | 분류된 업무의 지침(scenarios.md 해당 구역)을 프롬프트 끝에 더함 / `off` 면 더하지 않음 |
 | `JEV_MAX_PER_MIN` | 60 | Jev 분당 호출 상한 (BAZE 게이트웨이의 분당 120회를 LLM·음성과 나눠 쓰니 넘기지 않게) |
 | `TTS_STREAM` | 1 | 목소리를 조각으로 받는 대로 바로 내보내기 (0이면 끔) |

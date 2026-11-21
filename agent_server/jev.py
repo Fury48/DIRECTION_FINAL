@@ -21,7 +21,7 @@ MAX_PER_MIN = int(os.getenv("JEV_MAX_PER_MIN", 60))    # 1분에 부르는 최�
 
 EOT_FIRST_MS = int(os.getenv("EOT_FIRST_MS", 250))     # 무음이 이만큼 되면 처음 묻는다
 EOT_EVERY_MS = int(os.getenv("EOT_EVERY_MS", 200))     # 조용한 동안 이 간격으로 다시 묻는다
-EOT_END_MS = int(os.getenv("EOT_END_MS", 650))         # Jev 가 end 라고 하면 무음이 이만큼 되는 순간 끊는다 (완결 문장 뒤에 이어 말하기 전 쉼이 0.54~0.58초 있어서 그보다 길게)
+EOT_END_MS = int(os.getenv("EOT_END_MS", 1000))        # Jev 가 end 라고 하면 무음이 이만큼 되는 순간 끊는다 (연습 음성 문장 중간 쉼 상위 10%가 0.61~0.66초라 0.65초는 위험: 검토 1절)
 EOT_HOLD_MS = int(os.getenv("EOT_HOLD_MS", 2500))      # Jev 가 hold 라고 하면 무음이 이만큼 될 때까지 기다린다
 EOT_MIN_PROB = float(os.getenv("EOT_MIN_PROB", 0.75))  # 이보다 확신이 낮은 답은 쓰지 않는다 (예전 규칙으로)
 EOT_STALE_MS = int(os.getenv("EOT_STALE_MS", 650))     # 물어본 때보다 무음이 이만큼 더 길어졌으면 그 답은 낡았으니 버린다
@@ -42,7 +42,7 @@ SAME_TEXT_RATIO = 0.85                                 # 미리 분류한 글과
 def target():
     """(주소, 키, 모델). TYPESAFE_API_KEY 가 있으면 직접, 없고 BAZE_API_KEY 가 있으면 게이트웨이, 둘 다 없으면 (None, None, None)."""
     typesafe, baze = os.getenv("TYPESAFE_API_KEY", "").strip(), os.getenv("BAZE_API_KEY", "").strip()
-    model = os.getenv("TYPESAFE_MODEL", "jev-latest")
+    model = os.getenv("TYPESAFE_MODEL", "jev-1.14.0")   # jev-latest 는 게이트웨이에서 1.13.0 으로 연결됨 (실측)
     if typesafe:
         return os.getenv("TYPESAFE_URL", "https://api.typesafe.ai/v1/systemone"), typesafe, model
     if baze:
