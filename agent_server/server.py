@@ -26,7 +26,8 @@ from scipy.signal import resample_poly
 ROOT = Path(__file__).resolve().parents[1]
 for env in (Path(__file__).with_name(".env"), ROOT / ".env"):     # agent_server/.env 와 맨 위 폴더 .env 를 모두 읽는다 (제출할 땐 맨 위 폴더). 먼저 읽은 값, 이미 설정된 환경변수가 우선. 메모장 BOM 도 OK
     load_dotenv(env, encoding="utf-8-sig")
-BAZE_KEY = os.getenv("BAZE_API_KEY")                      # 대회 BAZE API Gateway 키. 있으면 LLM·STT·TTS 를 모두 이 키 하나로 부른다 (없으면 아래 세 키로 각 서비스를 직접 부른다)
+import jev                                                # Jev(말 끝 판정·업무 분류). .env 를 읽은 뒤에 불러와야 키·설정이 반영된다
+BAZE_KEY = os.getenv("BAZE_API_KEY")                     # 대회 BAZE API Gateway 키. 있으면 LLM·STT·TTS 를 모두 이 키 하나로 부른다 (없으면 아래 세 키로 각 서비스를 직접 부른다)
 BAZE_URL = os.getenv("BAZE_BASE_URL", "https://api.baze.co/v1/gateway").rstrip("/")
 missing = [] if BAZE_KEY else [k for k in ("OPENAI_API_KEY", "SONIOX_API_KEY", "GEMINI_API_KEY") if not os.getenv(k)]
 if missing:
@@ -282,33 +283,52 @@ def note_rate(caller, rate):
         PACE_PROFILES[caller] = rate if old is None else 0.6 * old + 0.4 * rate
 
 
-async def listen(ws, stt, pace_on=False, caller=""):
-    """말이 끝날 때까지 목소리를 받아 받아쓰기로 넘긴다. 돌려주는 값: 소리가 난 시간(voiced_ms)과, 말 속도로 대기를 조절했다면 그 내용(pace)."""
+async def listen(ws, stt, pace_on=False, caller="", judge=None, router=None):
+    """말이 끝날 때까지 목소리를 받아 받아쓰기로 넘긴다. judge(Jev 말 끝 판정)·router(Jev 업무 분류)가 있으면 조용한 동안 그쪽에 묻는다.
+    돌려주는 값: 소리가 난 시간(voiced_ms), 말 속도로 대기를 조절했다면 그 내용(pace), Jev 판정 요약(eot)."""
     voiced_ms = silent_ms = total_ms = 0
     pauses, info = [], None                                  # pauses: 말 중간에 쉰 시간들 (250ms 이상)
-    async for m in ws:
-        if not isinstance(m, bytes):
-            continue
-        stt.feed(m)                                          # 받아쓰기는 고객이 말하는 동안 이미 진행된다
-        ms = len(m) * 1000 // (RATE * 2)
-        total_ms += ms
-        if rms(m) >= SPEECH_RMS:
-            if silent_ms >= PACE_MIN_PAUSE_MS and voiced_ms >= MIN_SPEECH_MS:   # 쉬었다가 다시 말하기 시작함
-                pauses.append(silent_ms)
-            voiced_ms, silent_ms = voiced_ms + ms, 0
-        elif voiced_ms >= MIN_SPEECH_MS:                     # 말이 시작된 뒤의 조용한 시간만 센다
-            silent_ms += ms
-        wait_ms, info = END_SILENCE_MS, None
-        if silent_ms >= END_SILENCE_MS:
-            wait_ms = stt.wait_ms()
-            if pace_on and wait_ms == END_SILENCE_MS:        # 빨리 확정하는 기본 규칙에만 적용한다
-                rate = turn_rate(stt.text + stt.partial, voiced_ms) or PACE_PROFILES.get(caller)   # 이번 말로 못 재면 통화 누적값. (받아쓰기 글은 소리보다 늦게 와서 말하는 도중엔 속도가 실제보다 느리게 나오지만, 상한 배율이 막아 준다)
-                own = max(pauses, default=0)
-                wait_ms = pace_wait(wait_ms, rate, own)
-                info = {"cps": round(rate, 1) if rate else None, "own_pause_ms": own, "base_ms": END_SILENCE_MS, "thr_ms": round(wait_ms)}
-        if silent_ms >= wait_ms or total_ms >= MAX_LISTEN_MS:
-            break
-    return {"voiced_ms": voiced_ms, "pace": info}
+    try:
+        async for m in ws:
+            if not isinstance(m, bytes):
+                continue
+            stt.feed(m)                                      # 받아쓰기는 고객이 말하는 동안 이미 진행된다
+            ms = len(m) * 1000 // (RATE * 2)
+            total_ms += ms
+            if rms(m) >= SPEECH_RMS:
+                if silent_ms >= PACE_MIN_PAUSE_MS and voiced_ms >= MIN_SPEECH_MS:   # 쉬었다가 다시 말하기 시작함
+                    pauses.append(silent_ms)
+                if judge and silent_ms:
+                    judge.resume()                           # 다시 말했으니 이전 쉼에서 받은 판정은 버린다
+                voiced_ms, silent_ms = voiced_ms + ms, 0
+            elif voiced_ms >= MIN_SPEECH_MS:                 # 말이 시작된 뒤의 조용한 시간만 센다
+                silent_ms += ms
+            text, verdict = stt.text + stt.partial, None
+            if silent_ms:
+                if judge:
+                    judge.tick(text, silent_ms)              # Jev 에게 "지금 답해도 되나(end)/더 기다려야 하나(hold)" 묻는다 (답은 비동기로 온다)
+                    verdict = judge.verdict(text, silent_ms)
+                if router and silent_ms >= jev.CASE_EARLY_MS:
+                    router.speculate(text)                   # 말 끝 판정을 기다리는 동안 업무를 미리 분류해 둔다
+            wait_ms, info = END_SILENCE_MS, None
+            if silent_ms >= (jev.EOT_END_MS if verdict == "end" else END_SILENCE_MS):
+                wait_ms = stt.wait_ms()
+                if wait_ms == END_SILENCE_MS:                # 이어질 말투·번호·말 고치기 같은 규칙이 없는 보통 말
+                    if verdict == "end":
+                        wait_ms = jev.EOT_END_MS             # Jev 가 끝났다고 보면 650ms 만에 끊는다 (규칙이 '더 기다려라' 하면 규칙을 따른다: 끊는 쪽 실수는 속도 0점이라)
+                    elif pace_on:                            # 빨리 확정하는 기본 규칙에만 말 속도 조절을 적용한다
+                        rate = turn_rate(text, voiced_ms) or PACE_PROFILES.get(caller)   # 이번 말로 못 재면 통화 누적값. (받아쓰기 글은 소리보다 늦게 와서 말하는 도중엔 속도가 실제보다 느리게 나오지만, 상한 배율이 막아 준다)
+                        own = max(pauses, default=0)
+                        wait_ms = pace_wait(wait_ms, rate, own)
+                        info = {"cps": round(rate, 1) if rate else None, "own_pause_ms": own, "base_ms": END_SILENCE_MS, "thr_ms": round(wait_ms)}
+            if verdict == "hold":
+                wait_ms = max(wait_ms, jev.EOT_HOLD_MS)      # Jev 가 더 이어질 말이라고 보면 2.5초까지 기다린다
+            if silent_ms >= wait_ms or total_ms >= MAX_LISTEN_MS:
+                break
+    finally:
+        if judge:
+            judge.close()
+    return {"voiced_ms": voiced_ms, "pace": info, "eot": judge.summary() if judge else None}
 
 
 async def drain(ws):
@@ -452,7 +472,7 @@ def history_messages(history):
     return out
 
 
-def system_prompt(start, said=""):
+def system_prompt(start, said="", decision=None):
     fixed ="\n\n[고정 문장]\n아래 상황에서는 해당 문장을 한 글자도 바꾸지 말고 그 문장만 말한다.\n" + "\n".join(
         f"- {when}: {line}" for when, line in PHRASES.items())
     info = f"\n\n[통화 정보]\n현재 시각: {start.get('now')}"        # 통화마다 달라지는 내용은 맨 끝에 둔다 (앞부분이 같아야 LLM 이 캐시를 쓴다)
@@ -461,6 +481,8 @@ def system_prompt(start, said=""):
     if said:                                                         # 매크로가 이미 나간 통화: 같은 말을 되풀이하지 않게 알려 준다
         info += (f"\n서버가 방금 손님에게 먼저 한 말: \"{said}\" 이 말은 되풀이하지 말고 결과·본론부터 답한다. "
                  "'확인해 볼게요' 같은 말과 끝인사('더 궁금하신 점…')는 쓰지 않는다 (끝인사는 서버가 붙인다).")
+    if decision and decision.guide:                                  # Jev 가 업무를 가려냈으면 그 업무의 지침(scenarios.md 해당 구역)을 한 번 더 붙인다
+        info += f"\n[이번 통화의 업무: {decision.name}] 손님의 말이 이 업무로 분류됐다. 아래 지침을 우선 따른다 (다른 업무가 분명하면 그 업무 지침을 따른다).\n{decision.guide}"
     return PROMPT + fixed + info
 
 
@@ -471,11 +493,11 @@ def llm_options(tools=None):
     return options
 
 
-async def think(start, text, tools, filler=None, trace=None, said=""):
+async def think(start, text, tools, filler=None, trace=None, said="", decision=None):
     """LLM 에게 묻는다. 함수를 부르면 전산실에 물어보고 그 결과로 다시 묻는다. filler 는 함수를 부를 때 먼저 한마디 하는 함수 (말한 문장을 돌려줌).
     trace 가 리스트면 실제로 부른 함수와 결과를 history 형식으로 담는다 (시험기 live_chat.py 용)."""
     masker = Masker()
-    messages = [{"role": "system", "content": system_prompt(start, said)},
+    messages = [{"role": "system", "content": system_prompt(start, said, decision)},
                 *history_messages(start.get("history")),
                 {"role": "user", "content": text}]
     for round_no in range(MAX_TOOL_ROUNDS + 1):
@@ -726,13 +748,16 @@ def has_number(text, start):
     return bool(start.get("caller")) or any(h.get("role") == "tool_result" for h in history) or sum(c.isdigit() for c in said) >= 7 or "공일공" in said
 
 
-def pick_case(text, start):
+def pick_case(text, start, decision=None):
     """이번 손님 말의 유형을 키워드로 정해 (먼저 하는 말, 끝맺음 말을 붙일지) 를 돌려준다. 확실하지 않으면 None (잘못된 매크로는 없는 것보다 나쁘다).
-    같은 통화에서 이미 한 말은 피하고, 음성이 미리 만들어져 있지 않은 문구는 쓰지 않는다 (지금 만들면 오히려 늦다)."""
+    같은 통화에서 이미 한 말은 피하고, 음성이 미리 만들어져 있지 않은 문구는 쓰지 않는다 (지금 만들면 오히려 늦다).
+    decision(Jev 업무 분류)이 있으면 거부권만 준다: 상담원 연결·오배송·배송지 변경이거나 키워드와 다른 유형이면 매크로를 내보내지 않는다. (Jev 가 없거나 '기타'면 키워드만 본다)"""
     if not (MACRO and text) or SKIP_RE.search(text):
         return None
     hits = [name for name, case in CASES.items() if case[0].search(text)]
     if len(hits) != 1:
+        return None
+    if decision and decision.case_id and (decision.case_id in jev.NO_MACRO or (decision.macro and decision.macro != hits[0])):
         return None
     _, need_number, intros, closing = CASES[hits[0]]
     if need_number and not has_number(text, start):
@@ -750,15 +775,19 @@ def with_closing(reply, closing):
     return f"{reply.rstrip()}{'' if reply.rstrip()[-1] in '.!' else '.'} {random.choice(ready)}" if ready else reply
 
 
-async def respond(ws, start, stt, tools, lap, heard=None):
+async def respond(ws, start, stt, tools, lap, heard=None, router=None):
     cid = start.get("case_id")
     text = await stt.finish()
     lap("받아쓰기 확정")
     if heard and PACE_ADAPT != "off":                         # 확정된 글로 이 사람의 발음 속도를 통화 누적값에 섞는다 (다음 말에서 이번 말로 못 잴 때 쓴다)
         note_rate(str(start.get("caller") or ""), turn_rate(text, heard["voiced_ms"]))
+    decision = await router.resolve(text) if router and text else None   # Jev 업무 분류: 말하는 동안 미리 물어 둔 결과를 쓰고, 없으면 최대 CASE_WAIT_S 만 기다린다
+    if decision:
+        lap("업무 분류")
+        print(f"[{cid}] Jev 업무: {decision.short()}", flush=True)
     if start.get("debug"):                                    # 시험기에게 받아쓴 글을 바로 알려 준다 (손님이 말을 끊어도 어떤 말이었는지 기록할 수 있게)
         await ws.send(json.dumps({"type": "debug.heard", "customer": text}, ensure_ascii=False))
-    macro = pick_case(text, start)                            # (먼저 하는 말, 끝맺음 여부) 또는 None
+    macro = pick_case(text, start, decision)                  # (먼저 하는 말, 끝맺음 여부) 또는 None
     intro = asyncio.create_task(say(ws, macro[0])) if macro else None   # 고정 음성이라 바로 나간다. 그동안 아래에서 LLM 이 생각한다
 
     async def filler():
@@ -772,7 +801,7 @@ async def respond(ws, start, stt, tools, lap, heard=None):
 
     trace = [] if start.get("debug") else None                # 시험기(live_chat.py)가 session.start 에 debug 를 켠 때만 쓴다. 측정기는 켜지 않는다
     try:
-        reply = await think(start, text, await tools, None if macro else filler, trace, macro[0] if macro else "") if text else NOT_HEARD   # 매크로가 나갔으면 채움말은 또 하지 않는다
+        reply = await think(start, text, await tools, None if macro else filler, trace, macro[0] if macro else "", decision) if text else NOT_HEARD   # 매크로가 나갔으면 채움말은 또 하지 않는다
     except BaseException:
         if intro:
             intro.cancel()
@@ -790,13 +819,22 @@ async def respond(ws, start, stt, tools, lap, heard=None):
 
 async def talk(ws, start, stt):
     tools = asyncio.create_task(load_tools(start))            # 고객이 말하는 동안 미리 받아 둔다
-    heard = await listen(ws, stt, pace_enabled(start), str(start.get("caller") or ""))
+    judge = jev.TurnJudge(http, start.get("history")) if jev.active(jev.EOT_MODE, start) else None      # Jev 말 끝 판정 (키가 없거나 꺼져 있으면 None → 예전 규칙)
+    router = jev.CaseRouter(http, start.get("history")) if jev.active(jev.CASE_ROUTER, start) else None    # Jev 업무 분류
+    try:
+        heard = await listen(ws, stt, pace_enabled(start), str(start.get("caller") or ""), judge, router)
+    except BaseException:
+        if router:
+            router.close()
+        raise
     cid = start.get("case_id")
+    if e := heard["eot"]:                                     # 받아쓴 글은 남기지 않는다
+        print(f"[{cid}] Jev 말 끝: 요청 {e['calls']}회 (end {e['end']}·hold {e['hold']}·오류 {e['errors']}·글 모양으로 거름 {e['vetoed']}), 평균 {e['avg_ms']}ms", flush=True)
     if p := heard["pace"]:                                    # 받아쓴 글은 남기지 않는다. cps 를 보고 PACE_REF_CPS 를 맞춘다 (pace.md 7절)
         cps = str(p["cps"]) + "자/초" if p["cps"] else "(못 잼)"
         print(f"[{cid}] 말 속도 {cps}, 말 중간 최대 쉼 {p['own_pause_ms']}ms → 말 끝 대기 {p['base_ms']}→{p['thr_ms']}ms", flush=True)
     lap, sink = Lap(cid), asyncio.create_task(drain(ws))
-    work = asyncio.create_task(asyncio.wait_for(respond(ws, start, stt, tools, lap, heard), DEADLINE_S))
+    work = asyncio.create_task(asyncio.wait_for(respond(ws, start, stt, tools, lap, heard, router), DEADLINE_S))
     closed, gone = asyncio.create_task(ws.wait_closed()), False
     try:
         await asyncio.wait({work, closed}, return_when=asyncio.FIRST_COMPLETED)
@@ -819,6 +857,8 @@ async def talk(ws, start, stt):
     finally:
         sink.cancel()
         closed.cancel()
+        if router:
+            router.close()
         if not gone:
             lap.report()
             USAGE["calls"] += 1

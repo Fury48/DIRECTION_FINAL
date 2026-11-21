@@ -26,7 +26,8 @@ agent_server/       상담원 서버 (제출물)
   phrases/            미리 만들어 둔 고정 문구 음성 (처음 켤 때 자동 생성, 제출물에 포함할 것)
   .env.example        키 견본 (복사해서 .env 로)
   check_apis.py       API 3개가 되는지 점검 (개발용)
-  check_cases.py · check_mask.py · check_pace.py   유형 분류·번호 가림 처리·말 속도 대기 자가 점검 (개발용, 키 필요 없음)
+  jev.py              Jev 연동: 말 끝 판정(TurnJudge)·업무 분류(CaseRouter) (제출물)
+  check_cases.py · check_mask.py · check_pace.py · check_jev.py   유형 분류·번호 가림 처리·말 속도 대기·Jev 자가 점검 (개발용, 키 필요 없음)
 mock_tools/         가짜 전산실 (8100번) — lookup() 완성본 (제출물)
   check_lookup.py     lookup() 자가 점검 (개발용)
 eval/               측정기 run_eval · 채점기 score (운영진과 같은 도구) · record(마이크 녹음) · make_meta · live_chat(실시간 멀티턴 대화 시험) · credits(게이트웨이 남은 크레딧 확인: `python eval/credits.py`)
@@ -131,6 +132,12 @@ $env:PYTHONUTF8="1"; python eval/live_chat.py
 | `PACE_ADAPT` | live | 말이 느린 사람에게 기본 대기(0.8초)를 최대 1.2배까지 늘리는 기능 (`pace.md`). `off` 끔 / `live` 시험기·시연(session.start 에 debug)만 / `all` 측정 포함. **측정기에는 영향 없음(기본)** |
 | `PACE_REF_CPS` | 5.3 | 기준 발음 속도(글자/초). 이보다 느리면 대기를 늘림. 합성 음성 기준이라 **사람 목소리로 다시 맞출 것** |
 | `PACE_MAX_FACTOR` | 1.2 | 대기를 늘리는 최대 배율 (1.0 이면 늘리지 않음) |
+| `TYPESAFE_API_KEY` | (비움) | **Jev 키. `agent_server/.env` 에 이 한 줄만 넣으면 말 끝 판정·업무 분류가 바로 켜집니다** (`JEV_HANDOFF.md`) |
+| `EOT_MODE` / `CASE_ROUTER` | auto | Jev 말 끝 판정 / 업무 분류. `auto` 는 **TYPESAFE_API_KEY 가 있을 때만** 켬 / `jev` 는 어떤 키든 켬(제출용: BAZE 게이트웨이로 부름) / `live` 는 시험기·시연(debug)만 / `off` 끔 |
+| `TYPESAFE_MODEL` | jev-latest | Jev 모델 이름 (게이트웨이 목록에는 `jev-1.14.0`·`jev-1.13.0` 도 있음) |
+| `EOT_END_MS` / `EOT_HOLD_MS` / `EOT_MIN_PROB` | 650 / 2500 / 0.75 | Jev 가 end 면 무음 650ms 에 끊고, hold 면 2.5초까지 기다림. 확신이 0.75 미만이면 안 씀 |
+| `CASE_PROMPT` | add | 분류된 업무의 지침(scenarios.md 해당 구역)을 프롬프트 끝에 더함 / `off` 면 더하지 않음 |
+| `JEV_MAX_PER_MIN` | 60 | Jev 분당 호출 상한 (BAZE 게이트웨이의 분당 120회를 LLM·음성과 나눠 쓰니 넘기지 않게) |
 | `TTS_STREAM` | 1 | 목소리를 조각으로 받는 대로 바로 내보내기 (0이면 끔) |
 | `TTS_MODEL` / `TTS_VOICE` / `TTS_STYLE` | gemini-3.8-flash-tts / Kore / (비움) | 모델 / 목소리 / 읽어 달라는 지시. **3.8 모델은 지시어를 소리 내어 읽어서 비워 둡니다** (2.5·flash-lite 로 바꿀 때만 `Say: `) |
 | `MACRO` | 1 | 0이면 유형별 먼저 하는 말·끝맺음을 끔 (전후 비교용) |
@@ -144,6 +151,7 @@ $env:PYTHONUTF8="1"; python eval/live_chat.py
 - **(직접 호출할 때) Gemini TTS 분당 호출 한도가 위험입니다.** 개인 키는 Tier 1 이라 **분당 10회**이고, 넘으면 429 오류가 납니다. 최종 측정은 4문항을 동시에 계속 보내서 이 한도에 걸릴 수 있어요. (서버는 "8초 이하 뒤에 다시"라고 알려 주면 기다렸다 한 번 더 시도하고, 그래도 안 되면 사과 음성으로 `turn.end` 를 보냅니다.) **현장에서 쓰는 키의 한도를 꼭 확인하세요.**
 - **TTS 모델 이름이 문서마다 다릅니다.** 대회 원본 `README.md`·`SPEC.md` 는 `gemini-3.8-flash-lite-tts`, 운영진 공지는 "Gemini 3.8 flash", BAZE 게이트웨이 모델 목록에는 `gemini-3.8-flash-tts` 만 있습니다(2026-11-21 확인). 그래서 코드 기본값은 `gemini-3.8-flash-tts` 입니다. 개인 키로 직접 부를 땐 `TTS_MODEL=gemini-3.8-flash-lite-tts` 도 됩니다(지시어 없이). 어느 쪽으로 측정하는지는 운영진 확인 전입니다.
 - 응대 규칙은 `agent_server/prompt.md`, 자주 쓰는 고정 문구는 `server.py` 의 `PHRASES`/`FILLERS` 입니다. 문구를 바꾸면 `agent_server/phrases/` 의 오래된 파일은 지워도 됩니다 (자동으로 새로 만들어요).
+- **Jev 연동(`JEV_HANDOFF.md` 이식, `agent_server/jev.py`):** ① **말 끝 판정** — 말이 멈춘 동안 200ms 마다 Jev 에 "지금 답해도 되나(end)/더 들어야 하나(hold)"를 물어, end 면 무음 650ms 에, hold 면 2.5초까지 기다립니다. 인사만 했거나 `~는데요`로 끝난 글, 번호를 말하다 만 글, 말 고치는 중인 글은 Jev 가 end 라고 해도 믿지 않고 기존 규칙(1.8·2.5초)을 따릅니다(끊는 쪽 실수는 속도 0점이라). ② **업무 분류** — 말이 멈춘 동안 미리 업무(우리 시나리오 10개 + 기타)를 분류해 두고, 확정되면 (a) 그 업무의 지침을 프롬프트 끝에 더하고 (b) 상담원 연결·오배송·배송지 변경이거나 키워드와 다른 유형이면 "먼저 하는 말"(매크로)을 막습니다(거부권만 있고 새 매크로는 만들지 않음). 키가 없거나 실패·시간 초과·확신 낮음이면 **항상 예전 규칙**으로 돌아갑니다. 전화번호·주문번호는 `<번호>`로 가려서 보내고, 키 문제(401·402·403)는 5분, 한도(429)·연속 실패는 30초 쉽니다. `python agent_server/check_jev.py` 로 가짜 응답 점검(키 필요 없음), `python agent_server/check_jev.py --live` 로 진짜 Jev 한 번 호출. 서버 로그에 `Jev 말 끝: 요청 n회 …`, `Jev 업무: …` 한 줄이 나옵니다. **원본의 `stage`(처리 단계)·`missing`(누락 정보)·`action`(바로 시작할 작업/사전 안내)은 옮기지 않았습니다.** **제출 때:** TYPESAFE 키는 빼고, Jev 를 쓰려면 제출용 `.env` 에 `EOT_MODE=jev`·`CASE_ROUTER=jev` 를 적습니다(BAZE 게이트웨이 `/decisions/` 로 호출 — **크레딧이 있어야 하고**, 쓰지 않으려면 아무것도 안 적으면 예전 규칙).
 - **말 속도 대기(`pace.md` 이식):** 기본 0.8초 규칙에만, 말이 느린(받아쓴 글자 ÷ 소리 난 시간이 기준보다 작은) 사람이나 말 중간에 길게 쉬는 사람에게 대기를 최대 1.2배(0.96초)까지 늘립니다. 줄이지는 않고, 1.8·2.5초 규칙은 건드리지 않으며, 짧은 말·번호 위주의 말은 속도를 못 재서 그대로입니다. 켜면 서버 로그에 `말 속도 …자/초 … 말 끝 대기 800→960ms` 한 줄이 나오니, 평소 말하는 속도(cps)보다 약간 낮게 `PACE_REF_CPS` 를 맞추세요. **기본값(live)은 시험기·시연(`live_chat.py`)에서만 켜지고 측정기에는 영향이 없습니다.** 원본 설계와 다른 점: 우리는 말 한 번마다 연결이 새로 열려서 통화 누적 속도를 발신자(`caller`) 기준 메모리에 쌓고, "끼어들기에서 배운 쉼"과 판정 모델(Jev) 연동은 없습니다. `python agent_server/check_pace.py` 로 점검합니다.
 - 말 끝 판단은 "조용한 시간 + 말이 이어질 모양인지"로 합니다(`Stt.wait_ms()`): 기본 0.8초, 말이 이어질 어미(`~는데`)나 **번호를 말하다 만 모양**이면 1.8초, **말 고치기 시작 말**이면 2.5초. 연습 음성 6개(번호로 끝나는 말 포함)로 재 보니 보통 말은 이전과 똑같이 0.78초 뒤 끝났다고 판단했고, 번호 중간에 1.5초 쉬는 소리를 끼워 넣으면 이전엔 "010"에서 끊고 답했지만 이제는 번호를 끝까지 기다립니다. 받아쓰기가 마지막 글자를 한 박자 늦게 내줘서(`010`이 `01`로 보임) 숫자는 1자리부터 센다는 점에 주의하세요. 그래도 연습 음성 80개 중 4개는 말 중간에 0.8초 넘게 쉬어서, 이런 문항은 끼어들기(속도 0점) 위험이 남아 있습니다.
 - `history` 의 함수 호출·결과는 OpenAI 의 `tool_calls` 형식으로 바꿔서 LLM 에게 넘기고, 상담원 말에 섞인 링크·이모티콘은 지웁니다.
