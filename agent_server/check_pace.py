@@ -5,6 +5,7 @@ import asyncio, os, time
 import numpy as np
 
 os.environ.setdefault("BAZE_API_KEY", "x")                  # 시험용: 실제 호출은 하지 않음
+os.environ["END_SILENCE_MS"] = "800"                         # 아래 기대값은 기본 대기 800ms 기준으로 계산했다 (배율·상한 규칙을 보는 시험이라 기본값과 무관)
 import server
 
 assert server.PACE_REF_CPS == 5.3 and server.PACE_MAX_FACTOR == 1.2 and server.PACE_PLAY_MIN_SPEED == 0.85, "기본값이 바뀌었어요 (환경변수 PACE_* 를 지우고 다시 돌려 주세요)"
@@ -134,15 +135,17 @@ ms, h = waited(SLOW, [(LOUD, 250)], True, None);                  assert ms == 8
 ms, h = waited(SLOW, [(LOUD, 250)], True, prof());                assert ms == 800 and h["pace"]["cps"] == 3.2 and h["pace"]["ready"] is False   # 이 통화의 첫 말은 느려도 기록만
 ms, h = waited(SLOW, [(LOUD, 250)], True, prof(5.0));             assert ms == 960 and h["pace"]["ready"], ms                         # 이전 기록이 있으면 느린 사람은 800 × 1.2
 ms, h = waited(FAST, [(LOUD, 150)], True, prof(5.0));             assert ms == 800                                                    # 빠른 사람(32자/3초)은 그대로
-ms, h = waited("네.", [(LOUD, 100)], True, prof(4.0));            assert ms == 960 and h["pace"]["cps"] == 4.0                         # 이번 말로 못 재면 통화 누적 속도
-ms, h = waited("네.", [(LOUD, 100)], True, prof());               assert ms == 800                                                    # 근거가 전혀 없으면 손대지 않음
+ms, h = waited("배송비요", [(LOUD, 100)], True, prof(4.0));          assert ms == 960 and h["pace"]["cps"] == 4.0                         # 이번 말로 못 재면 통화 누적 속도
+ms, h = waited("배송비요", [(LOUD, 100)], True, prof());             assert ms == 800                                                    # 근거가 전혀 없으면 손대지 않음
 ms, h = waited(FAST, [(LOUD, 150)], True, prof(None, 780));       assert ms == 980 and h["pace"]["own_pause_ms"] == 780, (ms, h)       # 지난번에 0.78초 쉬다 끼어들렸다 → 0.975초 (20ms 단위로 올림)
 ms, h = waited(FAST, [(LOUD, 150)], True, prof(None, 2000));      assert ms == 1400, ms                                               # 쉼이 아주 길어도 기본 + 0.6초
 ms, h = waited(FAST, [(LOUD, 150)], True, prof(None, 2000), live=False);   assert ms == 1100, ms                                    # 측정 모드는 + 0.3초
 ms, h = waited(FAST, [(LOUD, 75), (QUIET, 35), (LOUD, 75)], True, prof(5.0));  assert ms == 880 and h["pace"]["own_pause_ms"] == 700   # 이번 말 중간에 0.7초 쉬었다 → 875ms
 ms, h = waited(FAST, [(LOUD, 75), (QUIET, 10), (LOUD, 75)], True, prof(5.0));  assert ms == 800 and h["pace"]["own_pause_ms"] == 0     # 0.2초 끊김은 쉼이 아님
 ms, h = waited("배송 확인하고 싶은데", [(LOUD, 250)], True, prof(4.0));   assert ms == server.LONG_SILENCE_MS and h["pace"] is None   # 이어질 말투(1.8초 규칙)는 건드리지 않음
-ms, h = waited("잘못 얘기했는데", [(LOUD, 250)], True, prof(4.0));        assert ms == server.CORRECT_SILENCE_MS and h["pace"] is None   # 말 고치기(2.5초 규칙)도 그대로
+ms, h = waited("아니,", [(LOUD, 250)], True, prof(4.0));                 assert ms == server.CORRECT_SILENCE_MS and h["pace"] is None   # 말 고치기(2.5초 규칙)도 그대로
+ms, h = waited("대장영양제.", [(LOUD, 250)], True, prof(4.0), live=False);   assert ms == server.NOUN_SILENCE_MS and h["pace"] is None      # 명사 끝(2.0초)·쉼표·인사 규칙도 그대로
+ms, h = waited("배송 언제 와요?", [(LOUD, 250)], True, prof(4.0), live=False);   assert ms == 1200 and h["pace"]["ready"], ms   # 문장부호 끝(1.0초)은 빠른 규칙이라 말 속도 조절 대상: 1000 × 1.2
 
 
 # 7. drain(): 말 끝으로 확정한 뒤 고객이 곧바로 이어 말하면 그 쉼을 배운다

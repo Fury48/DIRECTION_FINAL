@@ -233,14 +233,21 @@ def waited(text, reply, **kw):
 
 end = lambda b: choice("turn", "end", 0.95, ("hold",))
 hold = lambda b: choice("turn", "hold", 0.95, ("end",))
-ms, heard, h = waited(T, end);                       assert ms == jev.EOT_END_MS + 10 and heard["eot"]["end"] > 0, ms     # Jev end → 650ms (20ms 단위로 660)
-ms, heard, h = waited(T, hold);                      assert ms == jev.EOT_HOLD_MS, ms                                      # Jev hold → 2.5초
-ms, heard, h = waited(T, lambda b: Resp({}, 500));   assert ms == server.END_SILENCE_MS and heard["eot"]["errors"] > 0     # Jev 오류 → 예전 규칙 800ms
-ms, heard, h = waited(T, lambda b: choice("turn", "end", 0.5, ("hold",)));  assert ms == server.END_SILENCE_MS             # 확신 낮음 → 800ms
+up = lambda ms: -(-ms // 20) * 20                                                           # 20ms 조각 단위로 올림
+U = T.rstrip("?")                                                                            # 문장부호 없는 글: 이때만 Jev 판정을 쓴다
+saved_end, jev.EOT_END_MS = jev.EOT_END_MS, 650                                              # Jev end 가 대기를 줄이는지 보려고 기본(=END_SILENCE_MS)보다 짧게 둔다
+ms, heard, h = waited(U, end);                       assert ms == up(jev.EOT_END_MS) and heard["eot"]["end"] > 0, ms     # Jev end → EOT_END_MS
+ms, heard, h = waited(U, hold);                      assert ms == jev.EOT_HOLD_MS, ms                                      # Jev hold → 2.5초
+ms, heard, h = waited(U, lambda b: Resp({}, 500));   assert ms == server.END_SILENCE_MS and heard["eot"]["errors"] > 0     # Jev 오류 → 예전 규칙
+ms, heard, h = waited(U, lambda b: choice("turn", "end", 0.5, ("hold",)));  assert ms == server.END_SILENCE_MS             # 확신 낮음 → 예전 규칙
+ms, heard, h = waited(T, hold, live=False);          assert ms == server.PUNCT_SILENCE_MS, ms                               # 문장부호로 끝난 말은 Jev hold 를 따르지 않음 (검토 1절)
+ms, heard, h = waited(T, end, live=False);           assert ms == server.PUNCT_SILENCE_MS, ms                               # 문장부호로 끝난 말은 Jev end 로 줄이지도 않음
 ms, heard, h = waited("배송 확인하고 싶은데", end);  assert ms == server.LONG_SILENCE_MS, ms                                   # Jev 가 end 여도 '~는데'로 끝나면 규칙(1.8초)
 ms, heard, h = waited("잘못 얘기했는데", end);       assert ms == server.CORRECT_SILENCE_MS, ms                                # 말 고치기 시작 말은 2.5초
+ms, heard, h = waited("아니,", end);                 assert ms == server.CORRECT_SILENCE_MS, ms                                # 정정하는 말뿐이면 2.5초
 ms, heard, h = waited("010", end);                   assert ms >= server.LONG_SILENCE_MS, ms                                   # 번호를 말하다 쉬는 중에는 Jev end 를 따르지 않음
-ms, heard, h = waited(T, end, pace_on=True);         assert ms == jev.EOT_END_MS + 10                                          # Jev 가 있으면 말 속도 조절은 쓰지 않음
+ms, heard, h = waited(U, end, pace_on=True);         assert ms == up(jev.EOT_END_MS)                                          # Jev 가 있으면 말 속도 조절은 쓰지 않음
+jev.EOT_END_MS = saved_end
 reset()
 ws = FakeWs([(LOUD, 100), (QUIET, 20), (LOUD, 50), (QUIET, 300)])                                                           # 쉬는 중에 던진 질문의 답은, 다시 말하면 버린다
 judge = jev.TurnJudge(FakeHttp(end), None)
