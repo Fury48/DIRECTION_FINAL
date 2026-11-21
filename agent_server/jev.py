@@ -33,7 +33,7 @@ CASE_EARLY_MS = int(os.getenv("CASE_EARLY_MS", 300))   # 말을 멈추고 이만
 CASE_STABLE_MS = int(os.getenv("CASE_STABLE_MS", 100)) # 받아쓴 글이 이만큼 그대로일 때만 묻는다 (끝 글자가 따라오는 동안 횟수를 다 쓰지 않게)
 CASE_MAX_ATTEMPTS = int(os.getenv("CASE_MAX_ATTEMPTS", 10))
 CASE_TIMEOUT_S = float(os.getenv("CASE_TIMEOUT_S", 2.0))
-CASE_WAIT_S = float(os.getenv("CASE_WAIT_S", 0.3))     # 받아쓰기 확정 뒤 분류 결과를 더 기다리는 최대 시간 (넘으면 분류 없이 예전 방식)
+CASE_WAIT_S = float(os.getenv("CASE_WAIT_S", 0.1))     # 받아쓰기 확정 뒤 분류 결과를 더 기다리는 최대 시간 (넘으면 분류 없이 예전 방식). 이 시간만큼 '먼저 하는 말'과 LLM 호출이 늦어지니 짧게 둔다 (말하는 동안 미리 물어 두므로 보통은 기다릴 일이 없다)
 CASE_MIN_PROB = float(os.getenv("CASE_MIN_PROB", 0.5)) # 가장 높은 확률이 이보다 낮으면 분류를 쓰지 않는다
 SAME_TEXT_RATIO = 0.85                                 # 미리 분류한 글과 확정 글이 이만큼 비슷하면 미리 낸 결과를 그대로 쓴다
 

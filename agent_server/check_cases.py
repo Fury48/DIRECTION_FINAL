@@ -38,4 +38,25 @@ for r in rows:
     if "-v" in sys.argv and c:
         print(f"{c:6} | {r['customer_utterance'][:60]!r}")
 print("연습 문항 80개 유형 분포:", count)
+
+# ── 일반 첫마디(pick_opener) ──
+import jev
+for line in server.FILLERS:
+    server.FIXED[server.phrase_key(line)] = b""
+op = server.pick_opener
+got = op("배송비는 얼마예요?", {"history": []})
+assert got and got[0] in server.FILLERS and got[1] is False
+assert op("네", {"history": []}) is None and op("아니요", {"history": []}) is None                  # 짧은 대답
+assert op("잘못 얘기했는데요 다시 말씀드릴게요", {"history": []}) is None                         # 말 고치는 중
+assert op("약 먹고 두드러기가 났어요", {"history": []}) is None                                   # 조심할 말
+assert op("배송비는 얼마예요?", {"history": []}, jev.Decision(top="handoff", prob=0.9)) is None
+assert op("배송비는 얼마예요?", {"history": []}, jev.Decision(top="other", prob=0.9)) is None
+server.OPENER = False; assert op("배송비는 얼마예요?", {"history": []}) is None; server.OPENER = True
+
+# ── hold_ignored ──
+for t in ("안녕하세요.", "아 넵 감사합니다", "01079044351", "010-4957-6966입니다.", "제 주문 배송이 언제 오나요?", "반품회수해갔다네요"):
+    assert server.hold_ignored(t), t
+for t in ("", "주문번호가 DEMO1001인데요.", "하루온 간~", "주문할려고 하는데 여", "010-4957", "잠시만요", "배송 확인하고 싶은데"):
+    assert not server.hold_ignored(t), t
 print("전부 통과")
+
